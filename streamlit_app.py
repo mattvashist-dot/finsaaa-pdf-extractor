@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v12)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v12")
-st.caption("Better ReferralManager from 'Atentamente' and more reliable Company from 'Cliente:'.")
+st.set_page_config(page_title="FINSA PDF → CSV (v13)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v13")
+st.caption("Improved phone capture; trims empty columns on export; retains robust FINSA parsing rules.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -35,15 +35,22 @@ def _extract_text(file_bytes: bytes) -> str:
     except Exception:
         return ""
 
-def _fmt_phone(s: str) -> str:
-    s = (s or "").strip()
-    digits = re.sub(r"\D", "", s)
-    if len(digits) >= 10:
-        out = f"{digits[:3]}-{digits[3:6]}-{digits[6:10]}"
-        if len(digits) > 10:
-            out += f" x{digits[10:]}"
-        return out
-    return s
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+def _fmt_phone_mx(raw: str) -> str:
+    """
+    Returns numbers only (no EXT). Does not enforce 10 digits,
+    because some lines provide 7-12 digits. We keep what we have.
+    """
+    if not raw:
+        return ""
+    # cut off at EXT or similar
+    cut = re.split(r"\bEXT\.?\b", raw, flags=re.I)[0]
+    cut = re.split(r"\bEXTENSI[oó]N\b", cut, flags=re.I)[0]
+    # keep just digits
+    digits = _digits_only(cut)
+    return digits
 
 def _num_clean(s: str) -> str:
     if not s:
@@ -66,7 +73,14 @@ QNUM_RXS = [
 CLIENTE_ANYLINE_RX    = re.compile(r"Cliente\s*:?\s*([^\n]*)", re.I)  # cap rest-of-line (may be empty)
 CONTACTO_LINE_RX      = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
 ATN_LINE_RX           = re.compile(r"Atentamente\s*$", re.I)          # line that says Atentamente
-PHONE_RX              = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
+
+# Phone capture: lines that can contain the phone number
+PHONE_LINE_RXS = [
+    re.compile(r"Ci[eé]nega\s+de\s+Flores\s+TEL\.?\s*[:.]?\s*([^\n]+)", re.I),
+    re.compile(r"Tel[eé]fono\s*[:.]?\s*([^\n]+)", re.I),
+    re.compile(r"\bTEL\.?\s*[:.]?\s*([^\n]+)", re.I),
+]
+
 CUR_RX                = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
 
 # Item block: supports either header style (MODELO... or ARTICULO...IMPORTE...)
@@ -187,7 +201,7 @@ def sum_quantities_advanced(block_text: str) -> str:
     return f"{total:.2f}".rstrip("0").rstrip(".")
 
 # ========================
-# Name parsing
+# Name parsing & extraction
 # ========================
 def parse_first_last_from_string(full: str) -> (str, str, str):
     full = (full or "").strip()
@@ -211,7 +225,7 @@ def parse_first_last_from_string(full: str) -> (str, str, str):
     return first, last, full_title
 
 def extract_contact_names(raw_text: str) -> (str, str, str):
-    m_contact = CONTACTO_LINE_RX.search(raw_text or "")
+    m_contact = re.search(r"Contacto\s*:\s*([^\n]+)", raw_text or "", flags=re.I)
     if m_contact:
         first, last, full = parse_first_last_from_string(m_contact.group(1))
         if first or last:
@@ -233,7 +247,7 @@ def extract_referral_manager(raw_text: str) -> str:
         return ""
     lines = [ln.rstrip() for ln in raw_text.splitlines()]
     for i, ln in enumerate(lines):
-        if ATN_LINE_RX.search(ln or ""):
+        if re.search(r"Atentamente\s*$", ln or "", flags=re.I):
             for j in range(i+1, min(i+6, len(lines))):
                 candidate = (lines[j] or "").strip()
                 if not candidate:
@@ -266,7 +280,6 @@ def extract_quote_number(lines: list, raw_text: str) -> str:
                 if idx + k < len(lines):
                     window.append(lines[idx + k])
             joined = " ".join(window)
-            # find 4–8 digit groups; take the last one (ignores N04, keeps 8724)
             nums = re.findall(r"\b(\d{4,8})\b", joined)
             if nums:
                 return nums[-1].lstrip("0") or nums[-1]
@@ -293,29 +306,21 @@ def extract_company(lines: list, raw_text: str) -> str:
     else take the next line if the same-line capture is empty/very short.
     Keep digits + letters; trim extra spaces; skip obvious non-company labels.
     """
-    # First, try line-based scanning: faster and handles no-space cases
     for i, ln in enumerate(lines[:60]):  # top half of page
         m = CLIENTE_ANYLINE_RX.search(ln)
         if m:
             same = (m.group(1) or "").strip()
-            # If same-line part is empty or too short, check next line
-            next_line = ""
-            if (not same or len(same) < 3) and i + 1 < len(lines):
-                next_line = lines[i+1].strip()
+            next_line = lines[i+1].strip() if (not same or len(same) < 3) and i + 1 < len(lines) else ""
             candidate = same or next_line
 
-            # Clean & validate candidate
             candidate = re.sub(r"\s+", " ", candidate).strip()
-            # Skip lines that are clearly not the company field
             if re.search(r"(Contacto|Vendedor|Tel[eé]fono|Moneda|No\.|N°|Fecha|Atentamente)", candidate, re.I):
                 continue
-            # Ignore URLs/footers
             if re.search(r"(visita|www|http|https|\.com)", candidate, re.I):
                 continue
-            # Make sure we keep digits + letters (e.g., "2419 SABRITAS")
             if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", candidate):
                 return candidate
-    # As a fallback, use broad regex over raw text (same/next line)
+    # Fallback over raw text
     m2 = re.search(r"Cliente\s*:?\s*([^\n]+)\n?([^\n]*)", raw_text or "", flags=re.I)
     if m2:
         cand = (m2.group(1) or "").strip()
@@ -324,6 +329,27 @@ def extract_company(lines: list, raw_text: str) -> str:
         cand = re.sub(r"\s+", " ", cand).strip()
         if not re.search(r"(visita|www|http|https|\.com)", cand, flags=re.I):
             return cand
+    return ""
+
+# ========================
+# Phone extraction (Ciénega de Flores TEL. / Teléfono: / TEL.)
+# ========================
+def extract_phone(raw_text: str) -> str:
+    """
+    Capture the first phone-like line from the accepted labels.
+    Remove any EXT/extension part and return digits only.
+    """
+    for rx in PHONE_LINE_RXS:
+        for m in rx.finditer(raw_text or ""):
+            line = (m.group(1) or "").strip()
+            if not line:
+                continue
+            # remove anything after EXT
+            line = re.split(r"\bEXT\.?\b", line, flags=re.I)[0]
+            line = re.split(r"\bEXTENSI[oó]N\b", line, flags=re.I)[0]
+            digits = _fmt_phone_mx(line)
+            if digits:
+                return digits
     return ""
 
 # ========================
@@ -348,14 +374,11 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     # Company (improved)
     company = extract_company(lines, raw)
 
-    # Contact names (Contacto preferred)
+    # Contact (Contacto preferred; AT'N legacy fallback)
     first_name, last_name, contact_full = extract_contact_names(raw)
 
-    # Phone
-    phone = ""
-    m_phone = PHONE_RX.search(raw or "")
-    if m_phone:
-        phone = _fmt_phone(m_phone.group(1))
+    # Phone (improved)
+    phone = extract_phone(raw)
 
     # Currency
     currency = ""
@@ -444,7 +467,7 @@ else:
 strict = st.sidebar.checkbox(
     "Strict validation (Company, QuoteDate, TotalSales only)",
     value=True,
-    help="If fields are missing, they are listed for review but export is still allowed."
+    help="Missing fields are listed for review but export is still allowed. QuoteNumber is review-only."
 )
 
 files = st.file_uploader("Upload up to 100 FINSA PDF quotes", type=["pdf"], accept_multiple_files=True)
@@ -475,11 +498,11 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
         st.error("\n".join(errors))
 
     if rows:
-        df = pd.DataFrame(rows, columns=mapping_cols)
+        df_full = pd.DataFrame(rows, columns=mapping_cols)
 
         # List PDFs missing QuoteNumber (review only)
         try:
-            missing_q = df[df.get("QuoteNumber", "").astype(str).str.strip() == ""]
+            missing_q = df_full[df_full.get("QuoteNumber", "").astype(str).str.strip() == ""]
             if not missing_q.empty:
                 st.warning(
                     "QuoteNumber not found (left blank) in the following file(s):\n"
@@ -491,8 +514,8 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
         # Validation review (no blocking)
         if strict:
             problems = []
-            required_cols = [c for c in ["Company","QuoteDate","TotalSales"] if c in df.columns]
-            for idx, r in df.iterrows():
+            required_cols = [c for c in ["Company","QuoteDate","TotalSales"] if c in df_full.columns]
+            for idx, r in df_full.iterrows():
                 for col in required_cols:
                     if not str(r.get(col, "")).strip():
                         problems.append(f"Row {idx+1}: Missing '{col}'")
@@ -500,8 +523,11 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                 st.error("Validation review:")
                 st.code("\n".join(problems), language="text")
 
-        # Preview & Download
-        st.success(f"Parsed {len(rows)} file(s). You can review issues above and still export.")
+        # Trim columns that are 100% blank (your request)
+        non_empty_cols = [c for c in df_full.columns if df_full[c].astype(str).str.strip().any()]
+        df = df_full[non_empty_cols] if non_empty_cols else df_full
+
+        st.success(f"Parsed {len(rows)} file(s). Columns trimmed to those with data.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
@@ -510,4 +536,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v12: ReferralManager reliably parsed after 'Atentamente' (ignores footers/links, strips numbers). Company pulled robustly from 'Cliente:' even with no space and next-line variations. QuoteNumber review-only; Quantity & Total rules retained.")
+st.caption("v13: ContactPhone taken from Ciénega de Flores TEL./Teléfono:/TEL. lines (digits only, no EXT). Export trims columns that are completely blank while keeping your header order.")
