@@ -1,6 +1,6 @@
 import io, re, traceback
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import pandas as pd
 import streamlit as st
@@ -9,8 +9,8 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v8)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v8")
+st.set_page_config(page_title="FINSA PDF → CSV (v9)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v9")
 st.caption("Upload up to 100 FINSA PDFs, extract structured data to your mapping, and download one combined CSV.")
 
 MAX_FILES = 100
@@ -62,7 +62,11 @@ QNUM_RXS = [
     re.compile(r"(\d{5,8})\s*\nN[uú]mero\s*:", re.I),
 ]
 COMPANY_RX = re.compile(r"(?:Cliente\s*:\s*([^\n]+)|Cliente\s*\n([^\n]+))", re.I)
-CONTACT_RX = re.compile(r"(?:Contacto\s*:\s*([^\n]+)|AT'N\s*\n([^\n]+))", re.I)
+
+# NEW: Prefer Contacto: <name> on the same line. Fallback to AT'N on next line.
+CONTACTO_LINE_RX = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
+ATN_NEXTLINE_RX  = re.compile(r"AT'N\s*\n([^\n]+)", re.I)
+
 PHONE_RX   = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
 CUR_RX     = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
 SIGN_RX    = re.compile(r"Atentamente\s*\n([A-ZÁÉÍÓÚÑ ]{3,})", re.I)
@@ -92,8 +96,8 @@ def find_total_third_money_line(raw_text: str) -> str:
       8879.36
       Total
       64375.36
-      43   <-- sometimes appears; ignore (no decimals)
-    We return the 3rd decimal-like monetary value = the actual Total.
+      43   <-- ignore (no decimals)
+    Return the 3rd decimal-like monetary value = Total.
     """
     if not raw_text:
         return ""
@@ -163,7 +167,7 @@ def split_into_item_rows(block_text: str) -> list:
             rows.append(" ".join(cur))
     return rows
 
-def infer_quantity_from_row(row_text: str) -> float | None:
+def infer_quantity_from_row(row_text: str) -> Optional[float]:
     """
     Given a consolidated row string:
       1) Prefer number immediately before a UNIT token ("7 PZA") → qty=7
@@ -212,6 +216,41 @@ def sum_quantities_advanced(block_text: str) -> str:
     return f"{total:.2f}".rstrip("0").rstrip(".")
 
 # ========================
+# Name parsing
+# ========================
+def parse_first_last_from_string(full: str) -> (str, str, str):
+    """
+    Normalize capitalization and split first token vs the rest.
+    Returns (first, last, full_clean).
+    """
+    full = (full or "").strip()
+    if not full:
+        return "", "", ""
+    # Preserve common multi-word surnames; simple heuristic via title()
+    full_clean = " ".join(full.split())
+    full_title = full_clean.title()
+    parts = [p for p in full_title.split() if p]
+    first = parts[0] if parts else ""
+    last = " ".join(parts[1:]) if len(parts) > 1 else ""
+    return first, last, full_title
+
+def extract_contact_names(raw_text: str) -> (str, str, str):
+    """
+    Prefer 'Contacto: <NAME>' on the same line.
+    Fallback to AT'N on next line if Contacto is not present.
+    Returns (first, last, full_contact_name).
+    """
+    m_contact = CONTACTO_LINE_RX.search(raw_text or "")
+    if m_contact:
+        first, last, full = parse_first_last_from_string(m_contact.group(1))
+        return first, last, full
+    m_atn = ATN_NEXTLINE_RX.search(raw_text or "")
+    if m_atn:
+        first, last, full = parse_first_last_from_string(m_atn.group(1))
+        return first, last, full
+    return "", "", ""
+
+# ========================
 # PDF parser core (implements your rules)
 # ========================
 def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str]:
@@ -250,15 +289,8 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     if m_co:
         company = (m_co.group(1) or m_co.group(2) or "").strip()
 
-    # Contact (Contacto or AT'N) → FirstName / LastName
-    first_name = last_name = ""
-    m_ct = CONTACT_RX.search(raw or "")
-    if m_ct:
-        full = (m_ct.group(1) or m_ct.group(2) or "").strip().title()
-        parts = [p for p in full.split() if p]
-        if parts:
-            first_name = parts[0]
-            last_name = " ".join(parts[1:])
+    # Contact name (NEW logic: Contacto: preferred; fallback AT'N)
+    first_name, last_name, contact_full = extract_contact_names(raw)
 
     # Phone
     phone = ""
@@ -328,7 +360,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     setcol("ContactEmail", "")
     setcol("ContactPhone", phone)
     setcol("CurrencyCode", currency)
-    setcol("ContactName", f"{first_name} {last_name}".strip())
+    setcol("ContactName", contact_full.strip())
     setcol("Country", "Mexico" if currency == "MXN" else "")
     setcol("manufacturer_Name", "FINSA")
     setcol("item_id", item_id)
@@ -409,4 +441,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v8: Quantity parser rebuilt (handles wrapped rows, sums multi-line); TotalSales uses the 3rd monetary line; mapping upload remains open; ReferralEmail blank; ReferralManager from Atentamente.")
+st.caption("v9: First/Last name now taken from 'Contacto: <NAME>' (preferred), with AT'N as fallback; Quantity parser (multi-line) and TotalSales (3rd monetary line) remain in place.")
