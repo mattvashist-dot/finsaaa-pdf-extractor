@@ -9,14 +9,13 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v6-fixed)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v6 (regex-fixed)")
-st.caption("Upload up to 100 FINSA PDFs, map to your CSV headers, preview, then download one combined CSV.")
+st.set_page_config(page_title="FINSA PDF → CSV (v7)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v7 (Total line fixed)")
+st.caption("Uploads up to 100 FINSA PDFs, extracts structured data, and downloads one combined CSV.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
 
-# Default columns match your mapping order
 DEFAULT_COLS: List[str] = [
     "ReferralManager","ReferralEmail","Brand","QuoteNumber","QuoteDate",
     "Company","FirstName","LastName","ContactEmail","ContactPhone",
@@ -52,7 +51,7 @@ def _num_clean(s: str) -> str:
     return re.sub(r"[ ,]", "", s)
 
 # ========================
-# Regex (use flags arg, not inline (?i))
+# Regex patterns (use flags arg)
 # ========================
 DATE_RX = re.compile(r"\b([0-3]\d/[01]\d/\d{4})\b")  # dd/mm/yyyy
 HEADER_QUOTE_HINT = re.compile(r"\bCotizaci[oó]n\b", re.I)
@@ -61,32 +60,75 @@ QNUM_RXS = [
     re.compile(r"(?:\bN[uú]mero(?:\s+de\s+cotizaci[oó]n)?|Numero(?:\s+de\s+cotizacion)?|No\.?|N°)\s*:?\s*\n?(\d{5,8})", re.I),
     re.compile(r"(\d{5,8})\s*\nN[uú]mero\s*:", re.I),
 ]
-
-# Wrap alternations in a single pattern; apply re.I once
 COMPANY_RX = re.compile(r"(?:Cliente\s*:\s*([^\n]+)|Cliente\s*\n([^\n]+))", re.I)
 CONTACT_RX = re.compile(r"(?:Contacto\s*:\s*([^\n]+)|AT'N\s*\n([^\n]+))", re.I)
 PHONE_RX   = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
 CUR_RX     = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
 SIGN_RX    = re.compile(r"Atentamente\s*\n([A-ZÁÉÍÓÚÑ ]{3,})", re.I)
 
-# Table block from header row to Subtotal line (supports Sub-Total/Sub Total/Subtotal)
 ITEM_BLOCK_RX = re.compile(
     r"(?is)(?:MODELO.*?CANTIDAD.*?UNIDAD.*?\n)(.*?)(?:\nSub[\s-]?Total|\nSubtotal|\nSub Total)"
 )
 
-def find_amount(raw_text: str, lbl_pattern: str) -> str:
-    rx = re.compile(rf"{lbl_pattern}\s*[:\-]?\s*\n?\s*([\d\.,\s]+)", re.I)
-    matches = list(rx.finditer(raw_text or ""))
-    for m in reversed(matches):
-        g1 = m.group(1) if m else None
-        if g1:
-            return _num_clean(g1)
+# ========================
+# Custom total finder: 3rd monetary line
+# ========================
+def find_total_third_money_line(raw_text: str) -> str:
+    """
+    FINSA totals block pattern:
+      SubTotal
+      55496.00
+      IVA 16%
+      8879.36
+      Total
+      64375.36
+      43   <-- ignored
+    We want the 3rd decimal-like monetary value (Total).
+    """
+    if not raw_text:
+        return ""
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+
+    # find starting anchor
+    start_idx = None
+    anchors = re.compile(r"(Sub[\s-]?Total|Subtotal|Sub Total)", re.I)
+    for i, ln in enumerate(lines):
+        if anchors.search(ln):
+            start_idx = i
+            break
+    if start_idx is None:
+        for i, ln in enumerate(lines):
+            if re.search(r"\bTotal\b", ln, flags=re.I) and not re.search(r"Total\s*de\s*Art", ln, flags=re.I):
+                start_idx = i
+                break
+    if start_idx is None:
+        return ""
+
+    window = lines[start_idx:start_idx + 20]
+
+    money_rx = re.compile(r"\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b")
+    monies = []
+    for ln in window:
+        for m in money_rx.findall(ln):
+            val = m.replace(" ", "")
+            if "," in val and "." in val:
+                if val.rfind(",") > val.rfind("."):
+                    val = val.replace(".", "").replace(",", ".")
+                else:
+                    val = val.replace(",", "")
+            elif "," in val and "." not in val:
+                val = val.replace(".", "").replace(",", ".")
+            if "." in val:
+                monies.append(val)
+    if len(monies) >= 3:
+        return monies[2]
+    elif monies:
+        return monies[-1]
     return ""
 
 def sum_quantities(block: str) -> str:
     if not block:
         return ""
-    # quantities appear as: "1.00 KIT" / "7 PZA" etc → capture numeric
     qtys = re.findall(r"(?:^|\s)(\d+(?:\.\d{1,2})?)\s+(?:PZA|KIT|PZAS|SET|UND|PCS)\b", block, flags=re.I)
     try:
         s = sum(float(q) for q in qtys)
@@ -96,13 +138,12 @@ def sum_quantities(block: str) -> str:
         return ""
 
 # ========================
-# Core parser (implements your rules)
+# PDF parser core
 # ========================
 def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str]:
     raw = _extract_text(data)
-    lines = [ln for ln in (raw or "").splitlines() if ln and ln.strip()]
+    lines = [ln for ln in (raw or "").splitlines() if ln.strip()]
 
-    # QuoteNumber: prefer 5–8 digits near "Cotización" in header zone; else use "Número:"
     qnum = ""
     for i, ln in enumerate(lines[:25]):
         if HEADER_QUOTE_HINT.search(ln):
@@ -119,7 +160,6 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
                 if qnum:
                     break
 
-    # QuoteDate: dd/mm/yyyy → mm/dd/yyyy
     qdate = ""
     m_date = DATE_RX.search(raw or "")
     if m_date:
@@ -128,13 +168,11 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
         except Exception:
             qdate = ""
 
-    # Company (keep numeric prefix if present)
     company = ""
     m_co = COMPANY_RX.search(raw or "")
     if m_co:
         company = (m_co.group(1) or m_co.group(2) or "").strip()
 
-    # Contact (Contacto or AT'N) → FirstName / LastName
     first_name = last_name = ""
     m_ct = CONTACT_RX.search(raw or "")
     if m_ct:
@@ -144,31 +182,26 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
             first_name = parts[0]
             last_name = " ".join(parts[1:])
 
-    # Phone
     phone = ""
     m_phone = PHONE_RX.search(raw or "")
     if m_phone:
         phone = _fmt_phone(m_phone.group(1))
 
-    # Currency
     currency = ""
     m_cur = CUR_RX.search(raw or "")
     if m_cur:
         currency = (m_cur.group(1) or "").upper()
 
-    # ReferralManager from Atentamente
     referral_mgr = ""
     m_sig = SIGN_RX.search(raw or "")
     if m_sig:
         referral_mgr = (m_sig.group(1) or "").title().strip()
 
-    # Total at bottom (avoid "Total de Artículos")
-    total = find_amount(raw, r"Total(?!\s*de\s*Art)")
+    # >>> Use 3rd numeric value logic
+    total = find_total_third_money_line(raw)
 
-    # Items: sum quantities; leave item_id/item_desc blank if multiple lines
     item_id = item_desc = ""
     qty_total = ""
-    multi = False
     m_block = ITEM_BLOCK_RX.search(raw or "")
     if m_block:
         block = m_block.group(1) or ""
@@ -192,17 +225,15 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
             item_id = ""
             item_desc = ""
 
-    # PDF name
     pdf_name = f"FINSA_{qnum}.pdf" if qnum else (file_name or "")
 
-    # Build row by mapping
     row = {col: "" for col in out_cols}
     def setcol(col, val):
         if col in row:
             row[col] = val
 
     setcol("ReferralManager", referral_mgr)
-    setcol("ReferralEmail", "")  # always blank per your rule
+    setcol("ReferralEmail", "")
     setcol("Brand", "Finsa")
     setcol("QuoteNumber", qnum)
     setcol("QuoteDate", qdate)
@@ -220,11 +251,10 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     setcol("Quantity", qty_total)
     setcol("TotalSales", total)
     setcol("PDF", pdf_name)
-    # others remain blank
     return row
 
 # ========================
-# UI: mapping + upload + export
+# Streamlit UI
 # ========================
 st.sidebar.header("Output Mapping")
 mapping_file = st.sidebar.file_uploader(
@@ -239,10 +269,7 @@ if mapping_file is not None:
 else:
     mapping_cols = DEFAULT_COLS
 
-strict = st.sidebar.checkbox(
-    "Strict validation", value=True,
-    help="Require QuoteNumber, Company, QuoteDate, TotalSales."
-)
+strict = st.sidebar.checkbox("Strict validation", value=True)
 
 files = st.file_uploader("Upload up to 100 FINSA PDF quotes", type=["pdf"], accept_multiple_files=True)
 if files and len(files) > MAX_FILES:
@@ -258,14 +285,13 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
     with st.spinner("Parsing PDFs…"):
         for f in files:
             if f.size > MAX_FILE_MB * 1024 * 1024:
-                errors.append(f"{f.name}: exceeds size limit ({MAX_FILE_MB} MB).")
+                errors.append(f"{f.name}: exceeds {MAX_FILE_MB} MB limit.")
                 continue
             try:
                 row = parse_pdf(f.name, f.read(), mapping_cols)
                 rows.append(row)
             except Exception as e:
-                rows.append({"PDF": f.name, "_ERROR": f"{type(e).__name__}: {e}",
-                             "_TRACE": traceback.format_exc()[:1500]})
+                rows.append({"PDF": f.name, "_ERROR": str(e)})
                 errors.append(f"{f.name}: {e}")
 
     if errors:
@@ -273,29 +299,22 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
 
     if rows:
         df = pd.DataFrame(rows, columns=mapping_cols)
-
         if strict:
             problems = []
             for idx, r in df.iterrows():
                 for col in ["QuoteNumber","Company","QuoteDate","TotalSales"]:
                     if col in df.columns and not str(r.get(col, "")).strip():
-                        problems.append(f"Row {idx+1}: Missing required '{col}'")
+                        problems.append(f"Row {idx+1}: Missing '{col}'")
             if problems:
                 st.error("Validation failed. Please review:")
-                st.code("\n".join(problems), language="text")
+                st.code("\n".join(problems))
                 st.stop()
 
         st.success(f"Parsed {len(rows)} file(s) successfully.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ Download CSV",
-            data=csv_bytes,
-            file_name="finsa_parsed.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="finsa_parsed.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("v6-fixed: regex flags corrected; one row per PDF; sum Quantity across items; item_id/item_desc blank on multi-line; ReferralEmail blank; ReferralManager from Atentamente; Country=Mexico when Currency=MXN.")
+st.caption("v7: fixed regex; TotalSales now uses the 3rd monetary line (actual total); other rules unchanged.")
