@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v9)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v9")
-st.caption("Upload up to 100 FINSA PDFs, extract structured data to your mapping, and download one combined CSV.")
+st.set_page_config(page_title="FINSA PDF → CSV (v10)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v10")
+st.caption("Handles missing QuoteNumber gracefully (review-only), still lets you export all extracted data.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -63,7 +63,7 @@ QNUM_RXS = [
 ]
 COMPANY_RX = re.compile(r"(?:Cliente\s*:\s*([^\n]+)|Cliente\s*\n([^\n]+))", re.I)
 
-# NEW: Prefer Contacto: <name> on the same line. Fallback to AT'N on next line.
+# Prefer Contacto: <name>; fallback to AT'N next line
 CONTACTO_LINE_RX = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
 ATN_NEXTLINE_RX  = re.compile(r"AT'N\s*\n([^\n]+)", re.I)
 
@@ -216,7 +216,7 @@ def sum_quantities_advanced(block_text: str) -> str:
     return f"{total:.2f}".rstrip("0").rstrip(".")
 
 # ========================
-# Name parsing
+# Name parsing (Contacto preferred)
 # ========================
 def parse_first_last_from_string(full: str) -> (str, str, str):
     """
@@ -226,7 +226,6 @@ def parse_first_last_from_string(full: str) -> (str, str, str):
     full = (full or "").strip()
     if not full:
         return "", "", ""
-    # Preserve common multi-word surnames; simple heuristic via title()
     full_clean = " ".join(full.split())
     full_title = full_clean.title()
     parts = [p for p in full_title.split() if p]
@@ -289,7 +288,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     if m_co:
         company = (m_co.group(1) or m_co.group(2) or "").strip()
 
-    # Contact name (NEW logic: Contacto: preferred; fallback AT'N)
+    # Contact name (Contacto preferred; fallback AT'N)
     first_name, last_name, contact_full = extract_contact_names(raw)
 
     # Phone
@@ -340,7 +339,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
             item_id = ""
             item_desc = ""
 
-    # PDF name
+    # PDF name (use original if QuoteNumber is missing)
     pdf_name = f"FINSA_{qnum}.pdf" if qnum else (file_name or "")
 
     # Build row according to mapping
@@ -386,9 +385,11 @@ if mapping_file is not None:
 else:
     mapping_cols = DEFAULT_COLS
 
+# Note: Strict validation now EXCLUDES QuoteNumber (review-only).
 strict = st.sidebar.checkbox(
-    "Strict validation", value=True,
-    help="Require QuoteNumber, Company, QuoteDate, TotalSales."
+    "Strict validation (Company, QuoteDate, TotalSales only)",
+    value=True,
+    help="QuoteNumber is review-only; missing values will be listed but do not block export."
 )
 
 files = st.file_uploader("Upload up to 100 FINSA PDF quotes", type=["pdf"], accept_multiple_files=True)
@@ -421,18 +422,31 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
     if rows:
         df = pd.DataFrame(rows, columns=mapping_cols)
 
+        # --------- Review-only: show which PDFs lack QuoteNumber ----------
+        try:
+            missing_q = df[df.get("QuoteNumber", "").astype(str).str.strip() == ""]
+            if not missing_q.empty:
+                st.warning(
+                    "QuoteNumber not found in the following file(s). Values were left blank:\n"
+                    + "\n".join(f"- {r.get('PDF', '')}" for _, r in missing_q.iterrows())
+                )
+        except Exception:
+            pass
+
+        # --------- Strict validation (does NOT block export) ----------
         if strict:
             problems = []
+            required_cols = [c for c in ["Company","QuoteDate","TotalSales"] if c in df.columns]
             for idx, r in df.iterrows():
-                for col in ["QuoteNumber","Company","QuoteDate","TotalSales"]:
-                    if col in df.columns and not str(r.get(col, "")).strip():
+                for col in required_cols:
+                    if not str(r.get(col, "")).strip():
                         problems.append(f"Row {idx+1}: Missing '{col}'")
             if problems:
-                st.error("Validation failed. Please review:")
+                st.error("Validation review:")
                 st.code("\n".join(problems), language="text")
-                st.stop()
 
-        st.success(f"Parsed {len(rows)} file(s) successfully.")
+        # Always allow preview & download
+        st.success(f"Parsed {len(rows)} file(s). You can review issues above and still export.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
@@ -441,4 +455,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v9: First/Last name now taken from 'Contacto: <NAME>' (preferred), with AT'N as fallback; Quantity parser (multi-line) and TotalSales (3rd monetary line) remain in place.")
+st.caption("v10: Missing QuoteNumber is allowed (review-only list shown). Export always available; validation only flags Company/QuoteDate/TotalSales. All previous fixes retained (3rd monetary Total, robust Quantity, Contacto name).")
