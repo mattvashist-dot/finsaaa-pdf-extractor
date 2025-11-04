@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v11)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v11")
-st.caption("Improved QuoteNumber from 'Cotización …' and robust ReferralManager from 'Atentamente' lines.")
+st.set_page_config(page_title="FINSA PDF → CSV (v12)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v12")
+st.caption("Better ReferralManager from 'Atentamente' and more reliable Company from 'Cliente:'.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -62,11 +62,12 @@ QNUM_RXS = [
     re.compile(r"(\d{4,8})\s*\nN[uú]mero\s*:", re.I),
 ]
 
-COMPANY_RX = re.compile(r"(?:Cliente\s*:\s*([^\n]+)|Cliente\s*\n([^\n]+))", re.I)
-CONTACTO_LINE_RX = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
-ATN_LINE_RX      = re.compile(r"Atentamente\s*$", re.I)    # line that says Atentamente
-PHONE_RX         = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
-CUR_RX           = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
+# Company / contact / etc.
+CLIENTE_ANYLINE_RX    = re.compile(r"Cliente\s*:?\s*([^\n]*)", re.I)  # cap rest-of-line (may be empty)
+CONTACTO_LINE_RX      = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
+ATN_LINE_RX           = re.compile(r"Atentamente\s*$", re.I)          # line that says Atentamente
+PHONE_RX              = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
+CUR_RX                = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
 
 # Item block: supports either header style (MODELO... or ARTICULO...IMPORTE...)
 ITEM_BLOCK_RX = re.compile(
@@ -186,18 +187,25 @@ def sum_quantities_advanced(block_text: str) -> str:
     return f"{total:.2f}".rstrip("0").rstrip(".")
 
 # ========================
-# Name parsing (Contacto preferred; ReferralManager from Atentamente)
+# Name parsing
 # ========================
 def parse_first_last_from_string(full: str) -> (str, str, str):
     full = (full or "").strip()
     if not full:
         return "", "", ""
     full_clean = " ".join(full.split())
-    # Remove leading/trailing numbers (e.g., "43 Roberto Carrera" -> "Roberto Carrera")
-    full_clean = re.sub(r"^\d+\s+", "", full_clean)
-    full_clean = re.sub(r"\s+\d+\s*$", "", full_clean)
-    full_title = full_clean.title()
-    parts = [p for p in full_title.split() if p]
+    # Remove leading/trailing numbers or punctuation
+    full_clean = re.sub(r"^[\d\W_]+\s+", "", full_clean, flags=re.UNICODE)
+    full_clean = re.sub(r"\s+[\d\W_]+$", "", full_clean, flags=re.UNICODE)
+    # Ignore website/footer-y text
+    if re.search(r"(visita|www|http|https|finsa\.com)", full_clean, flags=re.I):
+        return "", "", ""
+    # Keep tokens that include letters (incl. accents/Ñ)
+    tokens = [t for t in full_clean.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
+    if not tokens:
+        return "", "", ""
+    full_title = " ".join(tokens).title()
+    parts = full_title.split()
     first = parts[0] if parts else ""
     last = " ".join(parts[1:]) if len(parts) > 1 else ""
     return first, last, full_title
@@ -206,41 +214,42 @@ def extract_contact_names(raw_text: str) -> (str, str, str):
     m_contact = CONTACTO_LINE_RX.search(raw_text or "")
     if m_contact:
         first, last, full = parse_first_last_from_string(m_contact.group(1))
-        return first, last, full
-    # Fallback: if "AT'N" layout exists (older quotes), handle it here if needed
+        if first or last:
+            return first, last, full
+    # optional legacy fallback (AT'N next line)
     m_atn_next = re.search(r"AT'N\s*\n([^\n]+)", raw_text or "", flags=re.I)
     if m_atn_next:
         first, last, full = parse_first_last_from_string(m_atn_next.group(1))
-        return first, last, full
+        if first or last:
+            return first, last, full
     return "", "", ""
 
 def extract_referral_manager(raw_text: str) -> str:
     """
-    Find 'Atentamente' line; take the first non-empty line after it,
-    strip any leading numbers, keep only the name (letters/spaces/accents),
-    and title-case it.
+    Find 'Atentamente' line; scan a few lines after; skip footer/URLs/numeric-only;
+    strip numbers/punct; return first good-looking human name.
     """
     if not raw_text:
         return ""
     lines = [ln.rstrip() for ln in raw_text.splitlines()]
     for i, ln in enumerate(lines):
         if ATN_LINE_RX.search(ln or ""):
-            # get next non-empty line within a short window
-            for j in range(i+1, min(i+4, len(lines))):
+            for j in range(i+1, min(i+6, len(lines))):
                 candidate = (lines[j] or "").strip()
                 if not candidate:
                     continue
-                # remove leading/trailing numbers
-                candidate = re.sub(r"^\d+\s+", "", candidate)
-                candidate = re.sub(r"\s+\d+\s*$", "", candidate)
-                # remove trailing punctuation
-                candidate = candidate.strip(" .,:;|-")
-                # keep words that are alphabetic (allow accents and Ññ)
-                tokens = candidate.split()
-                name_tokens = [t for t in tokens if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
-                if not name_tokens:
+                # Skip obvious footers / URLs
+                if re.search(r"(visita|www|http|https|\.com)", candidate, flags=re.I):
                     continue
-                name = " ".join(name_tokens).title()
+                # Remove numeric clutter
+                candidate = re.sub(r"^[\d\W_]+\s+", "", candidate, flags=re.UNICODE)
+                candidate = re.sub(r"\s+[\d\W_]+$", "", candidate, flags=re.UNICODE)
+                candidate = candidate.strip(" .,:;|-")
+                # Keep alphabetic-ish tokens only
+                tokens = [t for t in candidate.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
+                if not tokens:
+                    continue
+                name = " ".join(tokens).title()
                 if len(name) >= 2:
                     return name
     return ""
@@ -250,18 +259,17 @@ def extract_referral_manager(raw_text: str) -> str:
 # ========================
 def extract_quote_number(lines: list, raw_text: str) -> str:
     # 1) Look near any line containing "Cotización"
-    for idx, ln in enumerate(lines[:40]):  # restrict to header area
+    for idx, ln in enumerate(lines[:40]):  # header zone
         if HEADER_QUOTE_HINT.search(ln):
             window = [ln]
-            # include neighbors (same line and next few lines)
             for k in range(1, 6):
                 if idx + k < len(lines):
                     window.append(lines[idx + k])
             joined = " ".join(window)
-            # find 4–8 digit groups; take the last one (ignores things like N04)
+            # find 4–8 digit groups; take the last one (ignores N04, keeps 8724)
             nums = re.findall(r"\b(\d{4,8})\b", joined)
             if nums:
-                return nums[-1].lstrip("0") or nums[-1]  # keep significant digits
+                return nums[-1].lstrip("0") or nums[-1]
     # 2) Fallback to previous patterns (Número:, etc.)
     for rx in QNUM_RXS:
         m = rx.search(raw_text or "")
@@ -269,11 +277,53 @@ def extract_quote_number(lines: list, raw_text: str) -> str:
             cand = (m.group(1) or "").strip()
             if re.fullmatch(r"\d{4,8}", cand):
                 return cand.lstrip("0") or cand
-    # 3) Final fallback: search top area for standalone 4–8 digits
+    # 3) Final fallback: top area standalone 4–8 digits
     top = " ".join(lines[:40])
     m = re.search(r"\b(\d{4,8})\b", top)
     if m:
         return (m.group(1) or "").lstrip("0") or m.group(1)
+    return ""
+
+# ========================
+# Company extraction (more robust)
+# ========================
+def extract_company(lines: list, raw_text: str) -> str:
+    """
+    Grab content right after 'Cliente:' on the same line (even with no space),
+    else take the next line if the same-line capture is empty/very short.
+    Keep digits + letters; trim extra spaces; skip obvious non-company labels.
+    """
+    # First, try line-based scanning: faster and handles no-space cases
+    for i, ln in enumerate(lines[:60]):  # top half of page
+        m = CLIENTE_ANYLINE_RX.search(ln)
+        if m:
+            same = (m.group(1) or "").strip()
+            # If same-line part is empty or too short, check next line
+            next_line = ""
+            if (not same or len(same) < 3) and i + 1 < len(lines):
+                next_line = lines[i+1].strip()
+            candidate = same or next_line
+
+            # Clean & validate candidate
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            # Skip lines that are clearly not the company field
+            if re.search(r"(Contacto|Vendedor|Tel[eé]fono|Moneda|No\.|N°|Fecha|Atentamente)", candidate, re.I):
+                continue
+            # Ignore URLs/footers
+            if re.search(r"(visita|www|http|https|\.com)", candidate, re.I):
+                continue
+            # Make sure we keep digits + letters (e.g., "2419 SABRITAS")
+            if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", candidate):
+                return candidate
+    # As a fallback, use broad regex over raw text (same/next line)
+    m2 = re.search(r"Cliente\s*:?\s*([^\n]+)\n?([^\n]*)", raw_text or "", flags=re.I)
+    if m2:
+        cand = (m2.group(1) or "").strip()
+        if not cand or len(cand) < 3:
+            cand = (m2.group(2) or "").strip()
+        cand = re.sub(r"\s+", " ", cand).strip()
+        if not re.search(r"(visita|www|http|https|\.com)", cand, flags=re.I):
+            return cand
     return ""
 
 # ========================
@@ -295,13 +345,10 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
         except Exception:
             qdate = ""
 
-    # Company
-    company = ""
-    m_co = COMPANY_RX.search(raw or "")
-    if m_co:
-        company = (m_co.group(1) or m_co.group(2) or "").strip()
+    # Company (improved)
+    company = extract_company(lines, raw)
 
-    # Contact names
+    # Contact names (Contacto preferred)
     first_name, last_name, contact_full = extract_contact_names(raw)
 
     # Phone
@@ -316,7 +363,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     if m_cur:
         currency = (m_cur.group(1) or "").upper()
 
-    # ReferralManager from Atentamente (robust, strips numbers)
+    # ReferralManager from Atentamente (improved)
     referral_mgr = extract_referral_manager(raw)
 
     # TotalSales = 3rd monetary line in totals section
@@ -463,4 +510,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v11: QuoteNumber pulled from 'Cotización …' line when present; ReferralManager from the line after 'Atentamente' with numbers stripped; robust Quantity & TotalSales logic retained.")
+st.caption("v12: ReferralManager reliably parsed after 'Atentamente' (ignores footers/links, strips numbers). Company pulled robustly from 'Cliente:' even with no space and next-line variations. QuoteNumber review-only; Quantity & Total rules retained.")
