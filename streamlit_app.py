@@ -1,6 +1,6 @@
 import io, re, traceback
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v14)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v14")
-st.caption("Headers preserved; stronger ReferralManager & City; all earlier parsing rules kept.")
+st.set_page_config(page_title="FINSA PDF → CSV (v15)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v15")
+st.caption("Headers preserved. Better First/Last from Contacto/AT'N. City from Cliente-block line before TEL. Phone without EXT. Quantity & Total logic retained.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -46,11 +46,10 @@ def _digits_only(s: str) -> str:
 
 def _fmt_phone_mx(raw: str) -> str:
     """
-    Returns numbers only (no EXT). Does not enforce 10 digits (quotes vary).
+    Returns numbers only (no EXT). Does not enforce exact length.
     """
     if not raw:
         return ""
-    # cut off at EXT or similar
     cut = re.split(r"\bEXT\.?\b", raw, flags=re.I)[0]
     cut = re.split(r"\bEXTENSI[oó]N\b", cut, flags=re.I)[0]
     digits = _digits_only(cut)
@@ -69,13 +68,19 @@ QNUM_RXS = [
 ]
 
 CLIENTE_ANYLINE_RX    = re.compile(r"Cliente\s*:?\s*([^\n]*)", re.I)
-CONTACTO_LINE_RX      = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
-ATN_WORD_RX           = re.compile(r"Atentamente\s*$", re.I)
 
-PHONE_LINE_RXS = [
-    re.compile(r"([A-Za-zÁÉÍÓÚÑñ .]+?)\s+TEL\.?\s*[:.]?\s*([^\n]*)", re.I),  # captures City (group1) + rest (group2)
-    re.compile(r"([A-Za-zÁÉÍÓÚÑñ .]+?)\s+Tel[eé]fono\s*[:.]?\s*([^\n]*)", re.I),
-    re.compile(r"\bTEL\.?\s*[:.]?\s*([^\n]+)", re.I),  # phone only (no city)
+# Contact name patterns
+CONTACTO_LINE_RX      = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)    # Contacto: NAME (same line)
+ATN_SAME_LINE_RX      = re.compile(r"AT'N\s+([^\n]+)", re.I)            # AT'N NAME (same line)
+ATN_WORD_RX           = re.compile(r"Atentamente\s*$", re.I)            # line that says only Atentamente
+
+# Phone & City
+TEL_CITY_RXS = [
+    re.compile(r"([A-Za-zÁÉÍÓÚÑñ .]+?)\s+TEL\.?\s*[:.]?\s*([^\n]*)", re.I),      # City + TEL.
+    re.compile(r"([A-Za-zÁÉÍÓÚÑñ .]+?)\s+Tel[eé]fono\s*[:.]?\s*([^\n]*)", re.I), # City + Teléfono:
+]
+TEL_ONLY_RXS = [
+    re.compile(r"\bTEL\.?\s*[:.]?\s*([^\n]+)", re.I),
     re.compile(r"Tel[eé]fono\s*[:.]?\s*([^\n]+)", re.I),
 ]
 
@@ -194,63 +199,67 @@ def sum_quantities_advanced(block_text: str) -> str:
     return f"{total:.2f}".rstrip("0").rstrip(".")
 
 # ========================
-# Name parsing & extraction
+# Names & fields extraction
 # ========================
 def clean_name_line(s: str) -> str:
     s = (s or "").strip()
     if not s:
         return ""
-    # Skip obvious footer/link noise
     if re.search(r"(visita|www|http|https|\.com)", s, flags=re.I):
         return ""
-    # Strip leading/trailing numbers and punctuation
     s = re.sub(r"^[\d\W_]+\s+", "", s, flags=re.UNICODE)
     s = re.sub(r"\s+[\d\W_]+$", "", s, flags=re.UNICODE)
-    # Keep words containing letters (incl accents/Ñ)
     tokens = [t for t in s.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
     return " ".join(tokens).title() if tokens else ""
 
-def extract_contact_names(raw_text: str) -> (str, str, str):
+def split_first_last(full: str) -> Tuple[str, str]:
+    full = (full or "").strip()
+    if not full:
+        return "", ""
+    parts = full.split()
+    first = parts[0]
+    last = " ".join(parts[1:]) if len(parts) > 1 else ""
+    return first, last
+
+def extract_first_last_from_contact_or_atn(raw_text: str) -> Tuple[str, str, str]:
+    """
+    Priority:
+      1) Contacto: NAME (same line)  -> FirstName/LastName
+      2) AT'N NAME (same line)
+      3) Atentamente (next non-empty line) -> used only if 1/2 missing
+    """
+    # 1) Contacto:
     m_contact = CONTACTO_LINE_RX.search(raw_text or "")
     if m_contact:
         full = clean_name_line(m_contact.group(1))
-        parts = full.split() if full else []
-        first = parts[0] if parts else ""
-        last  = " ".join(parts[1:]) if len(parts) > 1 else ""
+        first, last = split_first_last(full)
         if first or last:
             return first, last, full
-    # legacy fallback (AT'N next line)
-    m_atn_next = re.search(r"AT'N\s*\n([^\n]+)", raw_text or "", flags=re.I)
-    if m_atn_next:
-        full = clean_name_line(m_atn_next.group(1))
-        parts = full.split() if full else []
-        return (parts[0] if parts else "", " ".join(parts[1:]) if len(parts) > 1 else "", full)
-    return "", "", ""
 
-def extract_referral_manager(raw_text: str) -> str:
-    """
-    Find the *last* occurrence of 'Atentamente' anywhere (bottom/center aligned).
-    Take the next non-empty line as the name, cleaned of numbers and junk.
-    Try up to 6 lines below to handle tiny text or line breaks.
-    """
-    if not raw_text:
-        return ""
-    lines = [ln.rstrip() for ln in raw_text.splitlines()]
+    # 2) AT'N on same line
+    m_atn_same = ATN_SAME_LINE_RX.search(raw_text or "")
+    if m_atn_same:
+        full = clean_name_line(m_atn_same.group(1))
+        first, last = split_first_last(full)
+        if first or last:
+            return first, last, full
+
+    # 3) Last "Atentamente" then next line
+    lines = [ln.rstrip() for ln in (raw_text or "").splitlines()]
     last_idx = None
     for i, ln in enumerate(lines):
         if ATN_WORD_RX.search(ln or ""):
             last_idx = i
-    if last_idx is None:
-        return ""
-    for j in range(last_idx + 1, min(last_idx + 7, len(lines))):
-        candidate = clean_name_line(lines[j])
-        if candidate:
-            return candidate
-    return ""
+    if last_idx is not None:
+        for j in range(last_idx + 1, min(last_idx + 7, len(lines))):
+            cand = clean_name_line(lines[j])
+            if cand:
+                first, last = split_first_last(cand)
+                return first, last, cand
 
-# ========================
+    return "", "", ""
+
 # Quote number extraction (includes 'Cotización N04     8724')
-# ========================
 def extract_quote_number(lines: list, raw_text: str) -> str:
     for idx, ln in enumerate(lines[:40]):  # header zone
         if HEADER_QUOTE_HINT.search(ln):
@@ -274,9 +283,7 @@ def extract_quote_number(lines: list, raw_text: str) -> str:
         return (m.group(1) or "").lstrip("0") or m.group(1)
     return ""
 
-# ========================
 # Company extraction (robust)
-# ========================
 def extract_company(lines: list, raw_text: str) -> str:
     for i, ln in enumerate(lines[:80]):
         m = CLIENTE_ANYLINE_RX.search(ln)
@@ -301,34 +308,48 @@ def extract_company(lines: list, raw_text: str) -> str:
             return cand
     return ""
 
-# ========================
-# City + Phone extraction
-# ========================
-def extract_city_and_phone(raw_text: str) -> (str, str):
+# City + Phone extraction with Cliente->TEL logic
+def extract_city_and_phone(lines: list, raw_text: str) -> Tuple[str, str]:
     """
-    City = text before TEL./Teléfono on the same line (letters & spaces, normalized).
-    Phone = digits only from the right side; EXT removed.
-    We scan for city+TEL lines first, then fall back to phone-only lines.
+    Preferred: from the block after the first 'Cliente:' line, take the first
+    following line containing TEL./Teléfono and return the substring BEFORE it as City.
+    Phone is the digits to the right of TEL./Teléfono (EXT removed).
+    Fallback: previous generic approach.
     """
-    # Try lines that include city before TEL / Teléfono
-    for rx in PHONE_LINE_RXS[:2]:  # first two patterns capture city + trailing text
+    # 1) Preferred (Cliente block)
+    cliente_idx = None
+    for i, ln in enumerate(lines):
+        if re.search(r"\bCliente\b", ln, flags=re.I):
+            cliente_idx = i
+            break
+    if cliente_idx is not None:
+        for j in range(cliente_idx + 1, min(cliente_idx + 12, len(lines))):
+            ln = lines[j]
+            m = re.search(r"(.+?)\s+(?:TEL\.?|Tel[eé]fono)\s*[:.]?\s*(.+)$", ln, flags=re.I)
+            if m:
+                city = re.sub(r"\s+", " ", (m.group(1) or "").strip(" .,:;-"))
+                phone = _fmt_phone_mx(m.group(2) or "")
+                if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", city):
+                    return (city.title(), phone)
+
+    # 2) Fallback: generic city+TEL patterns
+    for rx in TEL_CITY_RXS:
         for m in rx.finditer(raw_text or ""):
-            city_raw = (m.group(1) or "").strip()
-            right    = (m.group(2) or "").strip()
-            city = re.sub(r"\s+", " ", city_raw).strip(" .,:;-")
-            # avoid false positives like "Observaciones:" etc.
+            city = re.sub(r"\s+", " ", (m.group(1) or "").strip(" .,:;-"))
+            right = (m.group(2) or "").strip()
             if not re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", city):
                 city = ""
             phone = _fmt_phone_mx(right)
             if city or phone:
-                return (city.title(), phone)
-    # Fallback: phone-only line patterns
-    for rx in PHONE_LINE_RXS[2:]:
+                return (city.title() if city else "", phone)
+
+    # 3) Fallback: phone only
+    for rx in TEL_ONLY_RXS:
         for m in rx.finditer(raw_text or ""):
-            right = (m.group(1) or "").strip()
-            phone = _fmt_phone_mx(right)
+            phone = _fmt_phone_mx(m.group(1) or "")
             if phone:
                 return ("", phone)
+
     return ("", "")
 
 # ========================
@@ -350,19 +371,35 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
 
     company = extract_company(lines, raw)
 
-    first_name, last_name, contact_full = extract_contact_names(raw)
+    first_name, last_name, _contact_full = extract_first_last_from_contact_or_atn(raw)
 
-    city, phone = extract_city_and_phone(raw)
+    city, phone = extract_city_and_phone(lines, raw)
 
     currency = ""
     m_cur = CUR_RX.search(raw or "")
     if m_cur:
         currency = (m_cur.group(1) or "").upper()
 
+    # ReferralManager from Atentamente (last occurrence)
+    # Reuse last-Atentamente logic but without splitting
+    def extract_referral_manager(raw_text: str) -> str:
+        lines_local = [ln.rstrip() for ln in (raw_text or "").splitlines()]
+        last_idx = None
+        for i, ln in enumerate(lines_local):
+            if ATN_WORD_RX.search(ln or ""):
+                last_idx = i
+        if last_idx is not None:
+            for j in range(last_idx + 1, min(last_idx + 7, len(lines_local))):
+                cand = clean_name_line(lines_local[j])
+                if cand:
+                    return cand
+        return ""
+
     referral_mgr = extract_referral_manager(raw)
 
     total = find_total_third_money_line(raw)
 
+    # Items / Quantity
     item_id = item_desc = ""
     qty_total = ""
     multi = False
@@ -411,12 +448,12 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     setcol("TotalSales", total)
     setcol("PDF", pdf_name)
 
-    # Per earlier rules
+    # Per rules
     setcol("ReferralEmail", "")
     setcol("ContactEmail", "")
     setcol("CurrencyCode", currency)
     setcol("Country", "Mexico" if currency == "MXN" else "")
-    setcol("manufacturer_Name", "FINSA")
+    # IMPORTANT: manufacturer_Name should NOT be set anymore (left blank)
 
     # Leave other columns blank intentionally
     return row
@@ -431,7 +468,6 @@ mapping_file = st.sidebar.file_uploader(
 )
 if mapping_file is not None:
     try:
-        # We only need the header for order; rows not needed.
         mapping_cols = pd.read_csv(mapping_file, nrows=0).columns.tolist()
     except Exception:
         st.sidebar.error("Could not read mapping header; falling back to default headers.")
@@ -439,11 +475,10 @@ if mapping_file is not None:
 else:
     mapping_cols = DEFAULT_COLS
 
-# QuoteNumber is review-only (no blocking)
+# Optional review (does not block export)
 strict = st.sidebar.checkbox(
     "Show validation review (Company, QuoteDate, TotalSales)",
-    value=True,
-    help="Issues are shown for review but export is always allowed. QuoteNumber is review-only."
+    value=True
 )
 
 files = st.file_uploader("Upload up to 100 FINSA PDF quotes", type=["pdf"], accept_multiple_files=True)
@@ -477,7 +512,7 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
         # ALWAYS build DataFrame with the mapping header order (export headers preserved).
         df = pd.DataFrame(rows, columns=mapping_cols)
 
-        # List PDFs missing QuoteNumber (review only)
+        # Review lists (non-blocking)
         try:
             missing_q = df[df.get("QuoteNumber", "").astype(str).str.strip() == ""]
             if not missing_q.empty:
@@ -488,7 +523,6 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
         except Exception:
             pass
 
-        # Show non-blocking validation (optional)
         if strict:
             problems = []
             for idx, r in df.iterrows():
@@ -499,7 +533,7 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                 st.error("Validation review:")
                 st.code("\n".join(problems), language="text")
 
-        st.success(f"Parsed {len(rows)} file(s). Export contains ALL columns in your header order.")
+        st.success(f"Parsed {len(rows)} file(s). Export contains ALL columns in your header order; only mapped fields are filled.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
@@ -508,4 +542,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v14: Headers preserved as uploaded; ReferralManager = name after the last 'Atentamente'; City from text before TEL./Teléfono; robust Company/Quote/Quantity/Total/Phone kept.")
+st.caption("v15: manufacturer_Name left blank; First/Last strictly from Contacto or AT'N; City from Cliente-block TEL line; headers preserved; robust totals/quantity/phone remain.")
