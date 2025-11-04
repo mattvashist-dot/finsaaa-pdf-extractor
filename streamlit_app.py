@@ -9,14 +9,13 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v10)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v10")
-st.caption("Handles missing QuoteNumber gracefully (review-only), still lets you export all extracted data.")
+st.set_page_config(page_title="FINSA PDF → CSV (v11)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v11")
+st.caption("Improved QuoteNumber from 'Cotización …' and robust ReferralManager from 'Atentamente' lines.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
 
-# Default columns (keeps mapping upload open; order used if no mapping CSV provided)
 DEFAULT_COLS: List[str] = [
     "ReferralManager","ReferralEmail","Brand","QuoteNumber","QuoteDate",
     "Company","FirstName","LastName","ContactEmail","ContactPhone",
@@ -52,34 +51,29 @@ def _num_clean(s: str) -> str:
     return re.sub(r"[ ,]", "", s)
 
 # ========================
-# Regex patterns (use flags arg, avoid inline (?i) in alternations)
+# Regex patterns
 # ========================
 DATE_RX = re.compile(r"\b([0-3]\d/[01]\d/\d{4})\b")       # dd/mm/yyyy
 HEADER_QUOTE_HINT = re.compile(r"\bCotizaci[oó]n\b", re.I)
 
+# allow 4–8 digits (some quotes are 4 digits like 8724)
 QNUM_RXS = [
-    re.compile(r"(?:\bN[uú]mero(?:\s+de\s+cotizaci[oó]n)?|Numero(?:\s+de\s+cotizacion)?|No\.?|N°)\s*:?\s*\n?(\d{5,8})", re.I),
-    re.compile(r"(\d{5,8})\s*\nN[uú]mero\s*:", re.I),
+    re.compile(r"(?:\bN[uú]mero(?:\s+de\s+cotizaci[oó]n)?|Numero(?:\s+de\s+cotizacion)?|No\.?|N°)\s*:?\s*\n?(\d{4,8})", re.I),
+    re.compile(r"(\d{4,8})\s*\nN[uú]mero\s*:", re.I),
 ]
+
 COMPANY_RX = re.compile(r"(?:Cliente\s*:\s*([^\n]+)|Cliente\s*\n([^\n]+))", re.I)
-
-# Prefer Contacto: <name>; fallback to AT'N next line
 CONTACTO_LINE_RX = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
-ATN_NEXTLINE_RX  = re.compile(r"AT'N\s*\n([^\n]+)", re.I)
-
-PHONE_RX   = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
-CUR_RX     = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
-SIGN_RX    = re.compile(r"Atentamente\s*\n([A-ZÁÉÍÓÚÑ ]{3,})", re.I)
+ATN_LINE_RX      = re.compile(r"Atentamente\s*$", re.I)    # line that says Atentamente
+PHONE_RX         = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
+CUR_RX           = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
 
 # Item block: supports either header style (MODELO... or ARTICULO...IMPORTE...)
 ITEM_BLOCK_RX = re.compile(
     r"(?is)(?:MODELO.*?CANTIDAD.*?UNIDAD.*?\n|ARTICULO.*?IMPORTE.*?\n)(.*?)(?:\nSub[\s-]?Total|\nSubtotal|\nSub Total)"
 )
 
-# Units that may appear near quantity
 UNIT_TOKENS = r"(?:PZA|KIT|PZAS|SET|UND|PCS)"
-
-# Money formats like 6,872.00 / 27,488.00 / 288.50 / 28.008,00
 MONEY_RX = re.compile(r"\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b")
 INT_OR_DEC_RX = re.compile(r"\b\d+(?:\.\d+)?\b")
 UNIT_NEAR_QTY_RX = re.compile(rf"\b(\d+(?:\.\d+)?)\s+{UNIT_TOKENS}\b", re.I)
@@ -88,22 +82,10 @@ UNIT_NEAR_QTY_RX = re.compile(rf"\b(\d+(?:\.\d+)?)\s+{UNIT_TOKENS}\b", re.I)
 # Totals: pick the 3rd monetary line (Subtotal, IVA, Total)
 # ========================
 def find_total_third_money_line(raw_text: str) -> str:
-    """
-    FINSA totals block pattern:
-      SubTotal
-      55496.00
-      IVA 16%
-      8879.36
-      Total
-      64375.36
-      43   <-- ignore (no decimals)
-    Return the 3rd decimal-like monetary value = Total.
-    """
     if not raw_text:
         return ""
     lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
 
-    # find a starting anchor
     start_idx = None
     anchors = re.compile(r"(Sub[\s-]?Total|Subtotal|Sub Total)", re.I)
     for i, ln in enumerate(lines):
@@ -124,7 +106,6 @@ def find_total_third_money_line(raw_text: str) -> str:
     for ln in window:
         for m in MONEY_RX.findall(ln):
             val = m.replace(" ", "")
-            # normalize: 64,375.36 or 64.375,36 -> 64375.36
             if "," in val and "." in val:
                 if val.rfind(",") > val.rfind("."):
                     val = val.replace(".", "").replace(",", ".")
@@ -132,7 +113,7 @@ def find_total_third_money_line(raw_text: str) -> str:
                     val = val.replace(",", "")
             elif "," in val and "." not in val:
                 val = val.replace(".", "").replace(",", ".")
-            if "." in val:  # ignore plain integers
+            if "." in val:
                 monies.append(val)
 
     if len(monies) >= 3:
@@ -145,11 +126,6 @@ def find_total_third_money_line(raw_text: str) -> str:
 # Quantity parsing — robust for wrapped item rows
 # ========================
 def split_into_item_rows(block_text: str) -> list:
-    """
-    Combine wrapped lines into item rows by detecting when a line contains
-    >= 2 money tokens (price & importe). We accumulate lines until we see that,
-    then flush a completed item row.
-    """
     if not block_text:
         return []
     raw_lines = [ln for ln in block_text.splitlines() if ln.strip()]
@@ -168,12 +144,6 @@ def split_into_item_rows(block_text: str) -> list:
     return rows
 
 def infer_quantity_from_row(row_text: str) -> Optional[float]:
-    """
-    Given a consolidated row string:
-      1) Prefer number immediately before a UNIT token ("7 PZA") → qty=7
-      2) Else take the rightmost integer/decimal that occurs before the first money value
-         (helps when units split over lines or columns are misread)
-    """
     if not row_text:
         return None
 
@@ -216,17 +186,16 @@ def sum_quantities_advanced(block_text: str) -> str:
     return f"{total:.2f}".rstrip("0").rstrip(".")
 
 # ========================
-# Name parsing (Contacto preferred)
+# Name parsing (Contacto preferred; ReferralManager from Atentamente)
 # ========================
 def parse_first_last_from_string(full: str) -> (str, str, str):
-    """
-    Normalize capitalization and split first token vs the rest.
-    Returns (first, last, full_clean).
-    """
     full = (full or "").strip()
     if not full:
         return "", "", ""
     full_clean = " ".join(full.split())
+    # Remove leading/trailing numbers (e.g., "43 Roberto Carrera" -> "Roberto Carrera")
+    full_clean = re.sub(r"^\d+\s+", "", full_clean)
+    full_clean = re.sub(r"\s+\d+\s*$", "", full_clean)
     full_title = full_clean.title()
     parts = [p for p in full_title.split() if p]
     first = parts[0] if parts else ""
@@ -234,46 +203,90 @@ def parse_first_last_from_string(full: str) -> (str, str, str):
     return first, last, full_title
 
 def extract_contact_names(raw_text: str) -> (str, str, str):
-    """
-    Prefer 'Contacto: <NAME>' on the same line.
-    Fallback to AT'N on next line if Contacto is not present.
-    Returns (first, last, full_contact_name).
-    """
     m_contact = CONTACTO_LINE_RX.search(raw_text or "")
     if m_contact:
         first, last, full = parse_first_last_from_string(m_contact.group(1))
         return first, last, full
-    m_atn = ATN_NEXTLINE_RX.search(raw_text or "")
-    if m_atn:
-        first, last, full = parse_first_last_from_string(m_atn.group(1))
+    # Fallback: if "AT'N" layout exists (older quotes), handle it here if needed
+    m_atn_next = re.search(r"AT'N\s*\n([^\n]+)", raw_text or "", flags=re.I)
+    if m_atn_next:
+        first, last, full = parse_first_last_from_string(m_atn_next.group(1))
         return first, last, full
     return "", "", ""
 
+def extract_referral_manager(raw_text: str) -> str:
+    """
+    Find 'Atentamente' line; take the first non-empty line after it,
+    strip any leading numbers, keep only the name (letters/spaces/accents),
+    and title-case it.
+    """
+    if not raw_text:
+        return ""
+    lines = [ln.rstrip() for ln in raw_text.splitlines()]
+    for i, ln in enumerate(lines):
+        if ATN_LINE_RX.search(ln or ""):
+            # get next non-empty line within a short window
+            for j in range(i+1, min(i+4, len(lines))):
+                candidate = (lines[j] or "").strip()
+                if not candidate:
+                    continue
+                # remove leading/trailing numbers
+                candidate = re.sub(r"^\d+\s+", "", candidate)
+                candidate = re.sub(r"\s+\d+\s*$", "", candidate)
+                # remove trailing punctuation
+                candidate = candidate.strip(" .,:;|-")
+                # keep words that are alphabetic (allow accents and Ññ)
+                tokens = candidate.split()
+                name_tokens = [t for t in tokens if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
+                if not name_tokens:
+                    continue
+                name = " ".join(name_tokens).title()
+                if len(name) >= 2:
+                    return name
+    return ""
+
 # ========================
-# PDF parser core (implements your rules)
+# Quote number extraction (improved for 'Cotización N04     8724')
+# ========================
+def extract_quote_number(lines: list, raw_text: str) -> str:
+    # 1) Look near any line containing "Cotización"
+    for idx, ln in enumerate(lines[:40]):  # restrict to header area
+        if HEADER_QUOTE_HINT.search(ln):
+            window = [ln]
+            # include neighbors (same line and next few lines)
+            for k in range(1, 6):
+                if idx + k < len(lines):
+                    window.append(lines[idx + k])
+            joined = " ".join(window)
+            # find 4–8 digit groups; take the last one (ignores things like N04)
+            nums = re.findall(r"\b(\d{4,8})\b", joined)
+            if nums:
+                return nums[-1].lstrip("0") or nums[-1]  # keep significant digits
+    # 2) Fallback to previous patterns (Número:, etc.)
+    for rx in QNUM_RXS:
+        m = rx.search(raw_text or "")
+        if m:
+            cand = (m.group(1) or "").strip()
+            if re.fullmatch(r"\d{4,8}", cand):
+                return cand.lstrip("0") or cand
+    # 3) Final fallback: search top area for standalone 4–8 digits
+    top = " ".join(lines[:40])
+    m = re.search(r"\b(\d{4,8})\b", top)
+    if m:
+        return (m.group(1) or "").lstrip("0") or m.group(1)
+    return ""
+
+# ========================
+# PDF parser core
 # ========================
 def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str]:
     raw = _extract_text(data)
     lines = [ln for ln in (raw or "").splitlines() if ln.strip()]
 
-    # QuoteNumber: prefer near "Cotización" header; else use "Número:"
-    qnum = ""
-    for i, ln in enumerate(lines[:25]):
-        if HEADER_QUOTE_HINT.search(ln):
-            window = lines[max(0, i-3):i+6]
-            cand = next((x.strip() for x in window if re.fullmatch(r"\d{5,8}", x.strip())), "")
-            if cand:
-                qnum = cand
-                break
-    if not qnum:
-        for rx in QNUM_RXS:
-            m = rx.search(raw or "")
-            if m:
-                qnum = (m.group(1) or "").strip()
-                if qnum:
-                    break
+    # QuoteNumber improved
+    qnum = extract_quote_number(lines, raw)
 
-    # QuoteDate: dd/mm/yyyy → mm/dd/yyyy
+    # QuoteDate
     qdate = ""
     m_date = DATE_RX.search(raw or "")
     if m_date:
@@ -282,13 +295,13 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
         except Exception:
             qdate = ""
 
-    # Company (keep numeric prefix if present)
+    # Company
     company = ""
     m_co = COMPANY_RX.search(raw or "")
     if m_co:
         company = (m_co.group(1) or m_co.group(2) or "").strip()
 
-    # Contact name (Contacto preferred; fallback AT'N)
+    # Contact names
     first_name, last_name, contact_full = extract_contact_names(raw)
 
     # Phone
@@ -303,16 +316,13 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     if m_cur:
         currency = (m_cur.group(1) or "").upper()
 
-    # ReferralManager from Atentamente
-    referral_mgr = ""
-    m_sig = SIGN_RX.search(raw or "")
-    if m_sig:
-        referral_mgr = (m_sig.group(1) or "").title().strip()
+    # ReferralManager from Atentamente (robust, strips numbers)
+    referral_mgr = extract_referral_manager(raw)
 
     # TotalSales = 3rd monetary line in totals section
     total = find_total_third_money_line(raw)
 
-    # Items: sum quantities; blank item_id/item_desc if multiple items
+    # Items / Quantity
     item_id = item_desc = ""
     qty_total = ""
     multi = False
@@ -339,10 +349,8 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
             item_id = ""
             item_desc = ""
 
-    # PDF name (use original if QuoteNumber is missing)
     pdf_name = f"FINSA_{qnum}.pdf" if qnum else (file_name or "")
 
-    # Build row according to mapping
     row = {col: "" for col in out_cols}
     def setcol(col, val):
         if col in row:
@@ -359,7 +367,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     setcol("ContactEmail", "")
     setcol("ContactPhone", phone)
     setcol("CurrencyCode", currency)
-    setcol("ContactName", contact_full.strip())
+    setcol("ContactName", (first_name + " " + last_name).strip() or "")
     setcol("Country", "Mexico" if currency == "MXN" else "")
     setcol("manufacturer_Name", "FINSA")
     setcol("item_id", item_id)
@@ -385,11 +393,11 @@ if mapping_file is not None:
 else:
     mapping_cols = DEFAULT_COLS
 
-# Note: Strict validation now EXCLUDES QuoteNumber (review-only).
+# QuoteNumber is review-only (no blocking)
 strict = st.sidebar.checkbox(
     "Strict validation (Company, QuoteDate, TotalSales only)",
     value=True,
-    help="QuoteNumber is review-only; missing values will be listed but do not block export."
+    help="If fields are missing, they are listed for review but export is still allowed."
 )
 
 files = st.file_uploader("Upload up to 100 FINSA PDF quotes", type=["pdf"], accept_multiple_files=True)
@@ -422,18 +430,18 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
     if rows:
         df = pd.DataFrame(rows, columns=mapping_cols)
 
-        # --------- Review-only: show which PDFs lack QuoteNumber ----------
+        # List PDFs missing QuoteNumber (review only)
         try:
             missing_q = df[df.get("QuoteNumber", "").astype(str).str.strip() == ""]
             if not missing_q.empty:
                 st.warning(
-                    "QuoteNumber not found in the following file(s). Values were left blank:\n"
+                    "QuoteNumber not found (left blank) in the following file(s):\n"
                     + "\n".join(f"- {r.get('PDF', '')}" for _, r in missing_q.iterrows())
                 )
         except Exception:
             pass
 
-        # --------- Strict validation (does NOT block export) ----------
+        # Validation review (no blocking)
         if strict:
             problems = []
             required_cols = [c for c in ["Company","QuoteDate","TotalSales"] if c in df.columns]
@@ -445,7 +453,7 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                 st.error("Validation review:")
                 st.code("\n".join(problems), language="text")
 
-        # Always allow preview & download
+        # Preview & Download
         st.success(f"Parsed {len(rows)} file(s). You can review issues above and still export.")
         st.dataframe(df, use_container_width=True)
 
@@ -455,4 +463,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v10: Missing QuoteNumber is allowed (review-only list shown). Export always available; validation only flags Company/QuoteDate/TotalSales. All previous fixes retained (3rd monetary Total, robust Quantity, Contacto name).")
+st.caption("v11: QuoteNumber pulled from 'Cotización …' line when present; ReferralManager from the line after 'Atentamente' with numbers stripped; robust Quantity & TotalSales logic retained.")
