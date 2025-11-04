@@ -6,14 +6,17 @@ import pandas as pd
 import streamlit as st
 from pdfminer.high_level import extract_text
 
-st.set_page_config(page_title="FINSA PDF → CSV (v6)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v6")
+# ========================
+# App config / constants
+# ========================
+st.set_page_config(page_title="FINSA PDF → CSV (v6-fixed)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v6 (regex-fixed)")
 st.caption("Upload up to 100 FINSA PDFs, map to your CSV headers, preview, then download one combined CSV.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
 
-# Default columns = your mapping order (keep this in sync with your mapping CSV header)
+# Default columns match your mapping order
 DEFAULT_COLS: List[str] = [
     "ReferralManager","ReferralEmail","Brand","QuoteNumber","QuoteDate",
     "Company","FirstName","LastName","ContactEmail","ContactPhone",
@@ -23,7 +26,9 @@ DEFAULT_COLS: List[str] = [
     "Created_By","quote_line_no","DemoQuote"
 ]
 
-# ------------- Helpers -------------
+# ========================
+# Helpers
+# ========================
 @st.cache_data(show_spinner=False)
 def _extract_text(file_bytes: bytes) -> str:
     try:
@@ -46,23 +51,31 @@ def _num_clean(s: str) -> str:
         return ""
     return re.sub(r"[ ,]", "", s)
 
+# ========================
+# Regex (use flags arg, not inline (?i))
+# ========================
 DATE_RX = re.compile(r"\b([0-3]\d/[01]\d/\d{4})\b")  # dd/mm/yyyy
-HEADER_QUOTE_HINT = re.compile(r"(?i)\bCotizaci[oó]n\b")
-QNUM_RXS = [
-    re.compile(r"(?i)(?:\bN[uú]mero(?:\s+de\s+cotizaci[oó]n)?|Numero(?:\s+de\s+cotizacion)?|No\.?|N°)\s*:?\s*\n?(\d{5,8})"),
-    re.compile(r"(?i)(\d{5,8})\s*\nN[uú]mero\s*:")
-]
-COMPANY_RX = re.compile(r"(?i)Cliente\s*:\s*([^\n]+)|(?i)Cliente\s*\n([^\n]+)")
-CONTACT_RX = re.compile(r"(?i)Contacto\s*:\s*([^\n]+)|(?i)AT'N\s*\n([^\n]+)")
-PHONE_RX   = re.compile(r"(?i)Tel[eé]fono\s*:\s*([^\n]+)")
-CUR_RX     = re.compile(r"(?i)Moneda\s*:\s*([A-Z]{3})")
-SIGN_RX    = re.compile(r"(?i)Atentamente\s*\n([A-ZÁÉÍÓÚÑ ]{3,})")
+HEADER_QUOTE_HINT = re.compile(r"\bCotizaci[oó]n\b", re.I)
 
-# Table block from header row down to the Subtotal line (handles Sub-Total/Sub Total/Subtotal)
-ITEM_BLOCK_RX = re.compile(r"(?is)(?:MODELO.*?CANTIDAD.*?UNIDAD.*?\n)(.*?)(?:\nSub[\s-]?Total|\nSubtotal|\nSub Total)")
+QNUM_RXS = [
+    re.compile(r"(?:\bN[uú]mero(?:\s+de\s+cotizaci[oó]n)?|Numero(?:\s+de\s+cotizacion)?|No\.?|N°)\s*:?\s*\n?(\d{5,8})", re.I),
+    re.compile(r"(\d{5,8})\s*\nN[uú]mero\s*:", re.I),
+]
+
+# Wrap alternations in a single pattern; apply re.I once
+COMPANY_RX = re.compile(r"(?:Cliente\s*:\s*([^\n]+)|Cliente\s*\n([^\n]+))", re.I)
+CONTACT_RX = re.compile(r"(?:Contacto\s*:\s*([^\n]+)|AT'N\s*\n([^\n]+))", re.I)
+PHONE_RX   = re.compile(r"Tel[eé]fono\s*:\s*([^\n]+)", re.I)
+CUR_RX     = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
+SIGN_RX    = re.compile(r"Atentamente\s*\n([A-ZÁÉÍÓÚÑ ]{3,})", re.I)
+
+# Table block from header row to Subtotal line (supports Sub-Total/Sub Total/Subtotal)
+ITEM_BLOCK_RX = re.compile(
+    r"(?is)(?:MODELO.*?CANTIDAD.*?UNIDAD.*?\n)(.*?)(?:\nSub[\s-]?Total|\nSubtotal|\nSub Total)"
+)
 
 def find_amount(raw_text: str, lbl_pattern: str) -> str:
-    rx = re.compile(rf"(?i){lbl_pattern}\s*[:\-]?\s*\n?\s*([\d\.,\s]+)")
+    rx = re.compile(rf"{lbl_pattern}\s*[:\-]?\s*\n?\s*([\d\.,\s]+)", re.I)
     matches = list(rx.finditer(raw_text or ""))
     for m in reversed(matches):
         g1 = m.group(1) if m else None
@@ -73,7 +86,7 @@ def find_amount(raw_text: str, lbl_pattern: str) -> str:
 def sum_quantities(block: str) -> str:
     if not block:
         return ""
-    # quantities appear as: "1.00 KIT" / "7 PZA" etc → capture the numeric
+    # quantities appear as: "1.00 KIT" / "7 PZA" etc → capture numeric
     qtys = re.findall(r"(?:^|\s)(\d+(?:\.\d{1,2})?)\s+(?:PZA|KIT|PZAS|SET|UND|PCS)\b", block, flags=re.I)
     try:
         s = sum(float(q) for q in qtys)
@@ -82,11 +95,14 @@ def sum_quantities(block: str) -> str:
     except Exception:
         return ""
 
+# ========================
+# Core parser (implements your rules)
+# ========================
 def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str]:
     raw = _extract_text(data)
     lines = [ln for ln in (raw or "").splitlines() if ln and ln.strip()]
 
-    # QuoteNumber: prefer 5–8 digits near "Cotización" in the header zone; else use "Número:"
+    # QuoteNumber: prefer 5–8 digits near "Cotización" in header zone; else use "Número:"
     qnum = ""
     for i, ln in enumerate(lines[:25]):
         if HEADER_QUOTE_HINT.search(ln):
@@ -112,13 +128,13 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
         except Exception:
             qdate = ""
 
-    # Company: the text after "Cliente" (keep numeric prefix if present)
+    # Company (keep numeric prefix if present)
     company = ""
     m_co = COMPANY_RX.search(raw or "")
     if m_co:
         company = (m_co.group(1) or m_co.group(2) or "").strip()
 
-    # Contact (Contacto or AT'N)
+    # Contact (Contacto or AT'N) → FirstName / LastName
     first_name = last_name = ""
     m_ct = CONTACT_RX.search(raw or "")
     if m_ct:
@@ -149,7 +165,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     # Total at bottom (avoid "Total de Artículos")
     total = find_amount(raw, r"Total(?!\s*de\s*Art)")
 
-    # Items
+    # Items: sum quantities; leave item_id/item_desc blank if multiple lines
     item_id = item_desc = ""
     qty_total = ""
     multi = False
@@ -160,7 +176,6 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
         multi = len(nonempty) > 1
         qty_total = sum_quantities(block)
 
-        # only set item_id/desc if there is a single line item
         if not multi and nonempty:
             first_line = nonempty[0]
             m_model = re.search(r"([A-Z0-9][A-Z0-9\-]{5,})", first_line)
@@ -180,14 +195,14 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     # PDF name
     pdf_name = f"FINSA_{qnum}.pdf" if qnum else (file_name or "")
 
-    # Build output row according to mapping
+    # Build row by mapping
     row = {col: "" for col in out_cols}
     def setcol(col, val):
         if col in row:
             row[col] = val
 
     setcol("ReferralManager", referral_mgr)
-    setcol("ReferralEmail", "")                     # always blank per spec
+    setcol("ReferralEmail", "")  # always blank per your rule
     setcol("Brand", "Finsa")
     setcol("QuoteNumber", qnum)
     setcol("QuoteDate", qdate)
@@ -205,10 +220,12 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     setcol("Quantity", qty_total)
     setcol("TotalSales", total)
     setcol("PDF", pdf_name)
-    # Other columns remain empty unless you later give rules for them
+    # others remain blank
     return row
 
-# ------------- Sidebar -------------
+# ========================
+# UI: mapping + upload + export
+# ========================
 st.sidebar.header("Output Mapping")
 mapping_file = st.sidebar.file_uploader(
     "Upload mapping CSV (header defines output columns & order) – optional", type=["csv"]
@@ -227,7 +244,6 @@ strict = st.sidebar.checkbox(
     help="Require QuoteNumber, Company, QuoteDate, TotalSales."
 )
 
-# ------------- Main -------------
 files = st.file_uploader("Upload up to 100 FINSA PDF quotes", type=["pdf"], accept_multiple_files=True)
 if files and len(files) > MAX_FILES:
     st.warning(f"You selected {len(files)} files. Only the first {MAX_FILES} will be processed.")
@@ -273,9 +289,13 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Download CSV", data=csv_bytes,
-                           file_name="finsa_parsed.csv", mime="text/csv",
-                           use_container_width=True)
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_bytes,
+            file_name="finsa_parsed.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 st.markdown("---")
-st.caption("v6: exact FINSA mapping; one row per PDF; sum Quantity across items; blank item_id/item_desc on multi-line; ReferralEmail blank; ReferralManager from Atentamente; Country=Mexico when Currency=MXN.")
+st.caption("v6-fixed: regex flags corrected; one row per PDF; sum Quantity across items; item_id/item_desc blank on multi-line; ReferralEmail blank; ReferralManager from Atentamente; Country=Mexico when Currency=MXN.")
