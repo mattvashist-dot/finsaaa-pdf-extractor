@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v20)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v20")
-st.caption("Contacto pairing with nearest preceding Vigencia (within 12 lines). Robust fallback before Vendedor:. No 'Moneda: MXN' leakage.")
+st.set_page_config(page_title="FINSA PDF → CSV (v21)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v21")
+st.caption("Firstname/Lastname: Case A (Vigencia→Contacto), Case C (Contacto on same line, trim trailing labels/parentheses), Case B (left of Vendedor).")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -53,7 +53,7 @@ def _looks_like_person(name: str) -> bool:
     if re.search(r"(visita|www|http|https|\.com|subtotal|total|iva|observaciones|condiciones|telefono|tel\.)", name, re.I):
         return False
     toks = [t for t in name.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
-    return 2 <= len(toks) <= 6  # at least First + Last
+    return 2 <= len(toks) <= 6
 
 def _split_first_last(full: str) -> Tuple[str, str]:
     full = _clean_spaces(full)
@@ -65,7 +65,7 @@ def _split_first_last(full: str) -> Tuple[str, str]:
 # ========================
 # Regex patterns
 # ========================
-DATE_RX = re.compile(r"\b([0-3]\d/[01]\d/\d{4})\b")       # dd/mm/yyyy
+DATE_RX = re.compile(r"\b([0-3]\d/[01]\d/\d{4})\b")
 HEADER_QUOTE_HINT = re.compile(r"\bCotizaci[oó]n\b", re.I)
 QNUM_RXS = [
     re.compile(r"(?:\bN[uú]mero(?:\s+de\s+cotizaci[oó]n)?|Numero(?:\s+de\s+cotizacion)?|No\.?|N°)\s*:?\s*\n?(\d{4,8})", re.I),
@@ -73,10 +73,10 @@ QNUM_RXS = [
 ]
 CLIENTE_ANYLINE_RX = re.compile(r"Cliente\s*:?\s*([^\n]*)", re.I)
 
-VIGENCIA_RX      = re.compile(r"Vigencia\s*:", re.I)
-CONTACTO_RX      = re.compile(r"Contacto\s*:\s*(.*)$", re.I)  # captures rest of line (can be empty)
+VIGENCIA_RX  = re.compile(r"Vigencia\s*:", re.I)
+CONTACTO_RX  = re.compile(r"Contacto\s*:\s*(.*)$", re.I)  # rest of the line
+ATN_WORD_RX  = re.compile(r"Atentamente\s*$", re.I)
 
-ATN_WORD_RX      = re.compile(r"Atentamente\s*$", re.I)
 TEL_CITY_LINE_RX = re.compile(r"(.+?)\s+(?:TEL\.?|Tel[eé]fono)\s*[:.]?\s*([^\n]+)$", re.I)
 TEL_ONLY_RXS     = [
     re.compile(r"\bTEL\.?\s*[:.]?\s*([^\n]+)", re.I),
@@ -93,7 +93,7 @@ INT_OR_DEC_RX = re.compile(r"\b\d+(?:\.\d+)?\b")
 UNIT_NEAR_QTY_RX = re.compile(rf"\b(\d+(?:\.\d+)?)\s+{UNIT_TOKENS}\b", re.I)
 
 # ========================
-# Quantity & Total helpers (unchanged)
+# Quantity & Total helpers
 # ========================
 def find_total_third_money_line(raw_text: str) -> str:
     if not raw_text: return ""
@@ -167,7 +167,7 @@ def sum_quantities_advanced(block_text: str) -> str:
     return (f"{total:.2f}".rstrip("0").rstrip(".")) if found else ""
 
 # ========================
-# Field extractors
+# Field extractors (core)
 # ========================
 def extract_quote_number(lines: list, raw_text: str) -> str:
     for idx, ln in enumerate(lines[:40]):
@@ -202,75 +202,83 @@ def extract_company(lines: list, raw_text: str) -> str:
             return cand
     return ""
 
-def extract_first_last_strict(lines: list, raw_text: str) -> Tuple[str, str]:
+# ---------- NEW: 3-case First/Last ----------
+def extract_first_last_3cases(lines: list, raw_text: str) -> Tuple[str, str]:
     """
-    STRICT First/Last from two cases only.
-
-    Case A (preferred): find EVERY 'Contacto:' and pair with nearest preceding 'Vigencia:' within 12 lines.
-      - If text after colon is empty or too short, look at next non-empty line as the name line.
-      - Accept only alphabetic person-like names (2–6 tokens).
-    Case B (fallback): use text BEFORE 'Vendedor:' (join previous short line),
-      strip 'Moneda: XXX', then take the longest 2–6 word person phrase.
-
-    Else: return blanks.
+    Case A (preferred): Contacto: within 12 lines AFTER nearest preceding Vigencia:
+       - Use same-line text; if empty/short, use next non-empty line.
+       - Keep alphabetic tokens only (>=2 tokens).
+    Case C (new): Any Contacto: on the same line with name + trailing labels/parentheses.
+       - Trim everything AFTER the name: cut at '(', 'Días Ent', 'Dias Ent', 'Días', 'EDP', 'CANT', 'CLASIF',
+         'UNID', 'MODELO', 'PRECIO', 'IMPORTE', 'Moneda', 'Vendedor', 'Tel', 'Teléfono'.
+    Case B (fallback): Take text BEFORE 'Vendedor:' (join prev short line), strip 'Moneda: XXX',
+       choose longest 2–6 word person phrase.
+    Else: blanks.
     """
-    # Collect indexes of Vigencia and Contacto
+    # ---- Case A: pair Contacto with nearest preceding Vigencia (within 12 lines)
     vig_idxs = [i for i, ln in enumerate(lines) if VIGENCIA_RX.search(ln or "")]
-    cont_matches = [(i, CONTACTO_RX.search(lines[i] or "")) for i in range(len(lines)) if CONTACTO_RX.search(lines[i] or "")]
-    # Try to find a Contacto that has a Vigencia above it within 12 lines
-    best_contact = None
-    for ci, m in cont_matches:
-        name_inline = (m.group(1) or "").strip()
-        # Prefer the nearest preceding Vigencia within 12 lines
+    contacto_hits = [(i, CONTACTO_RX.search(lines[i] or "")) for i in range(len(lines)) if CONTACTO_RX.search(lines[i] or "")]
+    for ci, m in contacto_hits:
+        # find a Vigencia above and near
         nearest_vig = None
         for vi in reversed(vig_idxs):
             if vi < ci and (ci - vi) <= 12:
                 nearest_vig = vi
                 break
         if nearest_vig is None:
-            continue  # not in the Vigencia block
-        # Decide the actual name text
-        candidate = name_inline
+            continue
+        candidate = (m.group(1) or "").strip()
         if not candidate or len(candidate) < 2:
-            # Look ahead for the next non-empty line that looks like a name
-            lookahead = 2
-            for k in range(1, lookahead + 1):
+            # look at next non-empty line
+            for k in range(1, 3):
                 if ci + k < len(lines):
                     nxt = _clean_spaces(lines[ci + k])
-                    # Skip lines that are clearly labels or numeric
                     if not nxt or ":" in nxt or re.fullmatch(r"\d+", nxt):
                         continue
                     candidate = nxt
                     break
-        candidate = _clean_spaces(re.sub(r"\([^)]*\)", " ", candidate))  # remove parentheses like (PAGOS)
-        # Keep only alpha tokens
+        candidate = _clean_spaces(re.sub(r"\([^)]*\)", " ", candidate))
         toks = [t for t in candidate.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
         if len(toks) >= 2:
-            best_contact = " ".join(toks)
-            break  # we take the first good Contacto after a valid Vigencia
+            first, last = toks[0], " ".join(toks[1:])
+            return first.title(), last.title()
 
-    if best_contact:
-        first, last = _split_first_last(best_contact)
-        return first.title(), last.title()
-
-    # ---- Case B: between Moneda and Vendedor (left side of 'Vendedor:') ----
-    vend_line_idx = None
+    # ---- Case C: inline Contacto anywhere; trim trailing labels/parentheses
+    # Pattern: "Contacto: NOHEMI CORTES QUEVEDO (PAG..." or "Contacto: NAME Días Ent"
     for i, ln in enumerate(lines):
-        if re.search(r"\bVendedor\s*:", ln or "", flags=re.I):
+        m = CONTACTO_RX.search(ln or "")
+        if not m:
+            continue
+        right = _clean_spaces(m.group(1) or "")
+        if not right:
+            continue
+        # Trim at known label starts / parentheses
+        right = re.split(
+            r"\(|\bD[ií]as\s+Ent\b|\bD[ií]as\b|\bEDP\b|\bCANT\b|\bCLASIF\b|\bUNID\b|\bMODELO\b|\bPRECIO\b|\bIMPORTE\b|\bMoneda\b|\bVendedor\b|\bTel(?:efono)?\.?\b",
+            right, flags=re.I
+        )[0]
+        right = _clean_spaces(right)
+        toks = [t for t in right.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
+        if len(toks) >= 2:
+            first, last = toks[0], " ".join(toks[1:])
+            return first.title(), last.title()
+
+    # ---- Case B: left of Vendedor (with Moneda cleanup)
+    vend_line_idx = None
+    for i, l in enumerate(lines):
+        if re.search(r"\bVendedor\s*:", l or "", flags=re.I):
             vend_line_idx = i
             break
     if vend_line_idx is not None:
         left = lines[vend_line_idx].split("Vendedor", 1)[0]
         prev_chunk = ""
-        if vend_line_idx - 1 >= 0:
-            prev_line = lines[vend_line_idx - 1].strip()
-            if len(prev_line) < 80:
-                prev_chunk = prev_line
+        if vend_line_idx - 1 >= 0 and len(lines[vend_line_idx - 1].strip()) < 80:
+            prev_chunk = lines[vend_line_idx - 1].strip()
         candidate = _clean_spaces((prev_chunk + " " + left).strip())
         candidate = re.sub(r"Moneda\s*:\s*[A-Z]{3}", " ", candidate, flags=re.I)
         candidate = _clean_spaces(candidate)
         phrases = re.findall(r"([A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+){1,5})", candidate)
-        phrases = [p.strip() for p in phrases if _looks_like_person(p)]
+        phrases = [p for p in phrases if _looks_like_person(p)]
         if phrases:
             phrases.sort(key=lambda s: (len(s.split()), len(s)), reverse=True)
             best = phrases[0]
@@ -325,7 +333,7 @@ def extract_referral_manager_bottom(lines: list) -> str:
             continue
         window_lines.append(cand)
     joined = " ".join(window_lines)
-    joined = re.sub(r"^\s*\d+\s+", "", joined)               # drop leading numeric code
+    joined = re.sub(r"^\s*\d+\s+", "", joined)
     joined = re.sub(r"\bVisita\s*:.*$", "", joined, flags=re.I)
     phrases = re.findall(r"([A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+){1,5})", joined)
     phrases = [p for p in phrases if _looks_like_person(p)]
@@ -359,7 +367,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
             qdate = ""
 
     company = extract_company(lines, raw)
-    first_name, last_name = extract_first_last_strict(lines, raw)  # <-- NEW strict Contacto/Vigencia logic
+    first_name, last_name = extract_first_last_3cases(lines, raw)  # <--- NEW
     city, phone = extract_city_and_phone(lines, raw)
 
     currency = ""
@@ -465,7 +473,7 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
 
     if rows:
         df = pd.DataFrame(rows, columns=mapping_cols)
-        st.success(f"Parsed {len(rows)} file(s). First/Last only when Contacto-after-Vigencia or left-of-Vendedor cases match; otherwise blank.")
+        st.success("Parsed. First/Last populated only when one of the three cases matches; otherwise left blank.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
