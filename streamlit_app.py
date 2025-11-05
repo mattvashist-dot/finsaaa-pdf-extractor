@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v17)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v17")
-st.caption("ReferralManager = next line after last 'Atentamente' (skip numeric line, stop before 'Visita'). First/Last from Contacto near Vigencia. Headers preserved.")
+st.set_page_config(page_title="FINSA PDF → CSV (v18)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v18")
+st.caption("Stronger Contacto→First/Last; bottom Atentamente→ReferralManager (robust merge & name picking). Headers preserved.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -46,26 +46,66 @@ def _fmt_phone_mx(raw: str) -> str:
     cut = re.split(r"\bEXTENSI[oó]N\b", cut, flags=re.I)[0]
     return _digits_only(cut)
 
-def _clean_name_line(s: str) -> str:
-    """Remove leading/trailing numbers/punct; ignore URLs/footers; keep alpha words; Title Case."""
+def _clean_inline_name(s: str) -> str:
+    """
+    Clean a potential name chunk:
+      - remove URLs/Visita, leading/trailing punctuation/digits
+      - drop parentheses content
+      - collapse spaces
+      - Title case (keeps all-caps too)
+    """
     s = (s or "").strip()
     if not s:
         return ""
     if re.search(r"(visita|www|http|https|\.com)", s, flags=re.I):
         return ""
+    s = re.sub(r"\([^)]*\)", " ", s)  # remove (...) like (PAGOS)
     s = re.sub(r"^[\d\W_]+\s+", "", s, flags=re.UNICODE)
     s = re.sub(r"\s+[\d\W_]+$", "", s, flags=re.UNICODE)
-    tokens = [t for t in s.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
-    return " ".join(tokens).title() if tokens else ""
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def _looks_like_name(s: str) -> bool:
-    """Heuristic: 2–5 tokens, alphabetic-heavy, no URL/keywords."""
+    """
+    Heuristic: 2–6 alphabetic-ish tokens; no keywords; tokens contain letters (with accents).
+    Accepts UPPERCASE or Titlecase.
+    """
     if not s:
         return False
     if re.search(r"(visita|www|http|https|\.com|observaciones|condiciones|total|subtotal|iva)", s, flags=re.I):
         return False
     toks = [t for t in s.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
     return 1 <= len(toks) <= 6
+
+def _best_name_from_text(text: str) -> str:
+    """
+    From a short joined text, try to extract the longest plausible human name.
+    Strategy:
+      - split on punctuation to phrases
+      - pick longest phrase that looks like a name (2–6 tokens with letters)
+      - as fallback, join all tokens and re-check
+    """
+    text = _clean_inline_name(text)
+    if not text:
+        return ""
+    # remove leading codes like "43 " or "380 "
+    text = re.sub(r"^\d+\s+", "", text)
+    # split phrases on separators
+    parts = re.split(r"[|•·,;:]+", text)
+    candidates = []
+    for p in parts:
+        p = _clean_inline_name(p)
+        if _looks_like_name(p):
+            candidates.append(p)
+    if candidates:
+        # choose the one with the most tokens, then longest length
+        candidates.sort(key=lambda s: (len(s.split()), len(s)), reverse=True)
+        return candidates[0]
+    # fallback: take words with letters only
+    toks = [t for t in text.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
+    if len(toks) >= 1:
+        return " ".join(toks)
+    return ""
 
 def _split_first_last(full: str) -> Tuple[str, str]:
     full = (full or "").strip()
@@ -79,60 +119,47 @@ def _split_first_last(full: str) -> Tuple[str, str]:
 # ========================
 DATE_RX = re.compile(r"\b([0-3]\d/[01]\d/\d{4})\b")       # dd/mm/yyyy
 HEADER_QUOTE_HINT = re.compile(r"\bCotizaci[oó]n\b", re.I)
-
-# 4–8 digits (some quotes are 4 digits like 8724)
 QNUM_RXS = [
     re.compile(r"(?:\bN[uú]mero(?:\s+de\s+cotizaci[oó]n)?|Numero(?:\s+de\s+cotizacion)?|No\.?|N°)\s*:?\s*\n?(\d{4,8})", re.I),
     re.compile(r"(\d{4,8})\s*\nN[uú]mero\s*:", re.I),
 ]
-
 CLIENTE_ANYLINE_RX = re.compile(r"Cliente\s*:?\s*([^\n]*)", re.I)
 
-# Contacto / Vigencia / Atentamente
-CONTACTO_LINE_RX   = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)   # Contacto: NAME
-VIGENCIA_RX        = re.compile(r"Vigencia\s*:", re.I)
-ATN_WORD_RX        = re.compile(r"Atentamente\s*$", re.I)
-ATN_SAME_LINE_RX   = re.compile(r"AT'N\s+([^\n]+)", re.I)
+# Contacto / Vigencia / Atentamente / Tel
+CONTACTO_LINE_RX = re.compile(r"Contacto\s*:\s*([^\n]+)", re.I)
+VIGENCIA_RX      = re.compile(r"Vigencia\s*:", re.I)
+ATN_WORD_RX      = re.compile(r"Atentamente\s*$", re.I)
 
-# Phone + City
-TEL_CITY_RXS = [
-    re.compile(r"(.+?)\s+(?:TEL\.?|Tel[eé]fono)\s*[:.]?\s*([^\n]+)$", re.I),  # generic city+TEL line
-]
-TEL_ONLY_RXS = [
+TEL_CITY_LINE_RX = re.compile(r"(.+?)\s+(?:TEL\.?|Tel[eé]fono)\s*[:.]?\s*([^\n]+)$", re.I)
+TEL_ONLY_RXS     = [
     re.compile(r"\bTEL\.?\s*[:.]?\s*([^\n]+)", re.I),
     re.compile(r"Tel[eé]fono\s*[:.]?\s*([^\n]+)", re.I),
 ]
 
 CUR_RX = re.compile(r"Moneda\s*:\s*([A-Z]{3})", re.I)
-
-# Items block
 ITEM_BLOCK_RX = re.compile(
     r"(?is)(?:MODELO.*?CANTIDAD.*?UNIDAD.*?\n|ARTICULO.*?IMPORTE.*?\n)(.*?)(?:\nSub[\s-]?Total|\nSubtotal|\nSub Total)"
 )
 UNIT_TOKENS = r"(?:PZA|KIT|PZAS|SET|UND|PCS)"
-MONEY_RX    = re.compile(r"\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b")
+MONEY_RX = re.compile(r"\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b")
 INT_OR_DEC_RX = re.compile(r"\b\d+(?:\.\d+)?\b")
 UNIT_NEAR_QTY_RX = re.compile(rf"\b(\d+(?:\.\d+)?)\s+{UNIT_TOKENS}\b", re.I)
 
 # ========================
-# Totals: third monetary line (Subtotal, IVA, Total)
+# Totals: third monetary line
 # ========================
 def find_total_third_money_line(raw_text: str) -> str:
-    if not raw_text:
-        return ""
+    if not raw_text: return ""
     lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
     start_idx = None
     for i, ln in enumerate(lines):
         if re.search(r"(Sub[\s-]?Total|Subtotal|Sub Total)", ln, flags=re.I):
-            start_idx = i
-            break
+            start_idx = i; break
     if start_idx is None:
         for i, ln in enumerate(lines):
             if re.search(r"\bTotal\b", ln, flags=re.I) and not re.search(r"Total\s*de\s*Art", ln, flags=re.I):
-                start_idx = i
-                break
-    if start_idx is None:
-        return ""
+                start_idx = i; break
+    if start_idx is None: return ""
     window = lines[start_idx:start_idx + 20]
     monies = []
     for ln in window:
@@ -145,20 +172,16 @@ def find_total_third_money_line(raw_text: str) -> str:
                     val = val.replace(",", "")
             elif "," in val and "." not in val:
                 val = val.replace(".", "").replace(",", ".")
-            if "." in val:
-                monies.append(val)
-    if len(monies) >= 3:
-        return monies[2]
-    elif monies:
-        return monies[-1]
+            if "." in val: monies.append(val)
+    if len(monies) >= 3: return monies[2]
+    if monies: return monies[-1]
     return ""
 
 # ========================
 # Quantity parsing
 # ========================
 def split_into_item_rows(block_text: str) -> list:
-    if not block_text:
-        return []
+    if not block_text: return []
     raw_lines = [ln for ln in block_text.splitlines() if ln.strip()]
     rows, cur = [], []
     for ln in raw_lines:
@@ -166,22 +189,18 @@ def split_into_item_rows(block_text: str) -> list:
         if len(MONEY_RX.findall(ln)) >= 2:
             rows.append(" ".join(cur)); cur = []
     if cur:
-        if rows:
-            rows[-1] += " " + " ".join(cur)
-        else:
-            rows.append(" ".join(cur))
+        if rows: rows[-1] += " " + " ".join(cur)
+        else: rows.append(" ".join(cur))
     return rows
 
 def infer_quantity_from_row(row_text: str) -> Optional[float]:
-    if not row_text:
-        return None
+    if not row_text: return None
     m = UNIT_NEAR_QTY_RX.search(row_text)
     if m:
         try: return float(m.group(1))
         except: pass
     money_spans = list(MONEY_RX.finditer(row_text))
-    if not money_spans:
-        return None
+    if not money_spans: return None
     first_money_start = money_spans[0].start()
     candidates = []
     for nm in INT_OR_DEC_RX.finditer(row_text[:first_money_start]):
@@ -191,8 +210,7 @@ def infer_quantity_from_row(row_text: str) -> Optional[float]:
             if 0 <= v < 100000:
                 candidates.append((nm.start(), v))
         except: pass
-    if candidates:
-        return candidates[-1][1]
+    if candidates: return candidates[-1][1]
     return None
 
 def sum_quantities_advanced(block_text: str) -> str:
@@ -208,12 +226,11 @@ def sum_quantities_advanced(block_text: str) -> str:
 # Core field extractors
 # ========================
 def extract_quote_number(lines: list, raw_text: str) -> str:
-    for idx, ln in enumerate(lines[:40]):  # header zone
+    for idx, ln in enumerate(lines[:40]):
         if HEADER_QUOTE_HINT.search(ln):
             window = " ".join(lines[idx:idx+6])
             nums = re.findall(r"\b(\d{4,8})\b", window)
-            if nums:
-                return nums[-1].lstrip("0") or nums[-1]
+            if nums: return nums[-1].lstrip("0") or nums[-1]
     for rx in QNUM_RXS:
         m = rx.search(raw_text or "")
         if m:
@@ -242,37 +259,43 @@ def extract_company(lines: list, raw_text: str) -> str:
             return cand
     return ""
 
-def extract_first_last_from_vigencia_block(lines: list, raw_text: str) -> Tuple[str, str]:
-    """Find 'Vigencia:' and read Contacto: within next 6 lines."""
+def extract_first_last_from_vigencia_contacto(lines: list, raw_text: str) -> Tuple[str, str]:
+    """
+    Strict rule: find 'Vigencia:' line; within the next 8 lines, find 'Contacto:' and parse the name.
+    If not found, fallback to any 'Contacto:' in the doc.
+    """
+    # Preferred: relative to Vigencia
     vig_idx = None
     for i, ln in enumerate(lines):
         if VIGENCIA_RX.search(ln):
             vig_idx = i; break
     if vig_idx is not None:
-        for j in range(vig_idx+1, min(vig_idx+7, len(lines))):
+        for j in range(vig_idx+1, min(vig_idx+9, len(lines))):
             m = re.search(r"Contacto\s*:\s*([^\n]+)", lines[j], flags=re.I)
             if m:
-                full = _clean_name_line(m.group(1))
-                return _split_first_last(full)
-    # fallbacks
+                full = _clean_inline_name(m.group(1))
+                # remove parenthetical hints like (PAGOS)
+                full = re.sub(r"\([^)]*\)", " ", full)
+                full = re.sub(r"\s+", " ", full).strip()
+                first, last = _split_first_last(full)
+                return first, last
+    # Fallback: any 'Contacto:' line in the doc
     m_any = CONTACTO_LINE_RX.search(raw_text or "")
     if m_any:
-        full = _clean_name_line(m_any.group(1))
-        return _split_first_last(full)
-    m_atn_same = ATN_SAME_LINE_RX.search(raw_text or "")
-    if m_atn_same:
-        full = _clean_name_line(m_atn_same.group(1))
-        return _split_first_last(full)
+        full = _clean_inline_name(m_any.group(1))
+        full = re.sub(r"\([^)]*\)", " ", full)
+        full = re.sub(r"\s+", " ", full).strip()
+        first, last = _split_first_last(full)
+        return first, last
     return "", ""
 
 def extract_referral_manager_bottom(lines: list) -> str:
     """
-    Use the last 'Atentamente' occurrence (bottom).
-    Then:
-      - scan downward until 'Visita:' footer;
-      - if first next line is numeric-only (e.g., '43', '345'), skip it;
-      - take the next alphabetic line as the name.
-    If no suitable line found BELOW, fall back to a good-looking name line just ABOVE Atentamente.
+    Use the last 'Atentamente' (bottom).
+    Build a short window of up to 6 lines after it (until 'Visita:') and
+    extract the longest plausible person name after stripping codes & URLs.
+    Also handles cases where code+name are on same line (e.g., '43 Roberto Carrera').
+    Fallback: look just above 'Atentamente' if nothing found below.
     """
     last_idx = None
     for i, ln in enumerate(lines):
@@ -280,39 +303,48 @@ def extract_referral_manager_bottom(lines: list) -> str:
             last_idx = i
     if last_idx is None:
         return ""
-    # determine end bound (before 'Visita:')
-    stop_idx = len(lines)
+    # Bound by 'Visita:'
+    stop_idx = min(last_idx + 8, len(lines))
     for j in range(last_idx+1, min(last_idx+10, len(lines))):
         if re.search(r"^Visita\s*:", lines[j] or "", flags=re.I):
             stop_idx = j
             break
 
-    # scan downward
-    skipped_numeric = False
+    window_lines = []
     for j in range(last_idx+1, stop_idx):
-        line_raw = (lines[j] or "").strip()
-        if not line_raw:
+        cand = (lines[j] or "").strip()
+        if not cand:
             continue
-        if re.fullmatch(r"\d+", line_raw) and not skipped_numeric:
-            skipped_numeric = True
-            continue
-        cand = _clean_name_line(line_raw)
-        if cand and _looks_like_name(cand):
-            return cand
+        # if the numeric code and name are in one line, keep it; we'll strip digits later
+        if re.fullmatch(r"\d+", cand):
+            window_lines.append(cand)  # retain; strip later
+        else:
+            window_lines.append(cand)
+    joined = " ".join(window_lines).strip()
+    joined = re.sub(r"\bVisita\s*:.*$", "", joined, flags=re.I)  # hard stop at footer
+    # Strip obvious codes at start (e.g., "43 ", "260 ")
+    joined = re.sub(r"^\s*\d+\s+", "", joined)
+    # Clean and pick best name
+    name = _best_name_from_text(joined)
+    if name and _looks_like_name(name):
+        return name.title()
 
-    # fallback: look just above Atentamente (covers cases where name is printed above)
-    for k in range(last_idx-1, max(last_idx-4, -1), -1):
-        line_raw = (lines[k] or "").strip()
-        cand = _clean_name_line(line_raw)
-        if cand and _looks_like_name(cand):
-            return cand
-
-    return ""
+    # fallback: look above Atentamente
+    above_lines = []
+    for k in range(last_idx-1, max(last_idx-5, -1), -1):
+        cand = (lines[k] or "").strip()
+        if cand:
+            above_lines.append(cand)
+    joined_above = " ".join(above_lines)
+    joined_above = re.sub(r"^\s*\d+\s+", "", joined_above)
+    name2 = _best_name_from_text(joined_above)
+    return name2.title() if name2 else ""
 
 def extract_city_and_phone(lines: list, raw_text: str) -> Tuple[str, str]:
     """
-    Preferred: after the first 'Cliente:' line, find first following line with TEL./Teléfono and
-    return (text before TEL as City, digits after as Phone). Fallback: generic search.
+    Preferred: after first 'Cliente:' line, take the first following line with TEL./Teléfono
+    as 'City [before TEL]' and phone digits after TEL (EXT removed).
+    Fallback: generic search.
     """
     cliente_idx = None
     for i, ln in enumerate(lines):
@@ -321,22 +353,19 @@ def extract_city_and_phone(lines: list, raw_text: str) -> Tuple[str, str]:
     if cliente_idx is not None:
         for j in range(cliente_idx + 1, min(cliente_idx + 15, len(lines))):
             ln = lines[j]
-            m = re.search(r"(.+?)\s+(?:TEL\.?|Tel[eé]fono)\s*[:.]?\s*(.+)$", ln, flags=re.I)
+            m = TEL_CITY_LINE_RX.search(ln)
             if m:
                 city = re.sub(r"\s+", " ", (m.group(1) or "").strip(" .,:;-"))
                 phone = _fmt_phone_mx(m.group(2) or "")
                 if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", city):
                     return (city.title(), phone)
-    # fallback: generic city+TEL
-    for m in TEL_CITY_RXS[0].finditer(raw_text or ""):
-        city = re.sub(r"\s+", " ", (m.group(1) or "").strip(" .,:;-"))
-        right = (m.group(2) or "").strip()
-        if not re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", city):
-            city = ""
+    # fallback: generic
+    m2 = TEL_CITY_LINE_RX.search(raw_text or "")
+    if m2:
+        city = re.sub(r"\s+", " ", (m2.group(1) or "").strip(" .,:;-"))
+        right = (m2.group(2) or "").strip()
         phone = _fmt_phone_mx(right)
-        if city or phone:
-            return (city.title() if city else "", phone)
-    # fallback: phone only
+        return (city.title(), phone if phone else "")
     for rx in TEL_ONLY_RXS:
         for m in rx.finditer(raw_text or ""):
             phone = _fmt_phone_mx(m.group(1) or "")
@@ -363,11 +392,10 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
 
     company = extract_company(lines, raw)
 
-    first_name, last_name = extract_first_last_from_vigencia_block(lines, raw)
+    first_name, last_name = extract_first_last_from_vigencia_contacto(lines, raw)
 
     city, phone = extract_city_and_phone(lines, raw)
 
-    # Currency (kept for Country calc, though not exported if mapping lacks the column)
     currency = ""
     m_cur = CUR_RX.search(raw or "")
     if m_cur:
@@ -377,7 +405,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
 
     total = find_total_third_money_line(raw)
 
-    # Items / Quantity
+    # Items / Quantity (kept, but you can leave item_id/desc blank for multi-line)
     item_id = item_desc = ""
     qty_total = ""
     m_block = ITEM_BLOCK_RX.search(raw or "")
@@ -515,4 +543,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v17: ReferralManager strictly after last 'Atentamente' (skip numeric line, stop at 'Visita'), with fallback to line above when needed; First/Last from Contacto near Vigencia; headers preserved.")
+st.caption("v18: Contacto→First/Last tuned around 'Vigencia'; Atentamente footer logic merged lines and extracts longest person name; headers preserved.")
