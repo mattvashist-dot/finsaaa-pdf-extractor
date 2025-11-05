@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v16)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v16")
-st.caption("ReferralManager from bottom Atentamente (skips numeric line, stops before Visita). First/Last from Contacto near Vigencia. Headers preserved.")
+st.set_page_config(page_title="FINSA PDF → CSV (v17)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v17")
+st.caption("ReferralManager = next line after last 'Atentamente' (skip numeric line, stop before 'Visita'). First/Last from Contacto near Vigencia. Headers preserved.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -57,6 +57,15 @@ def _clean_name_line(s: str) -> str:
     s = re.sub(r"\s+[\d\W_]+$", "", s, flags=re.UNICODE)
     tokens = [t for t in s.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
     return " ".join(tokens).title() if tokens else ""
+
+def _looks_like_name(s: str) -> bool:
+    """Heuristic: 2–5 tokens, alphabetic-heavy, no URL/keywords."""
+    if not s:
+        return False
+    if re.search(r"(visita|www|http|https|\.com|observaciones|condiciones|total|subtotal|iva)", s, flags=re.I):
+        return False
+    toks = [t for t in s.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
+    return 1 <= len(toks) <= 6
 
 def _split_first_last(full: str) -> Tuple[str, str]:
     full = (full or "").strip()
@@ -258,11 +267,12 @@ def extract_first_last_from_vigencia_block(lines: list, raw_text: str) -> Tuple[
 
 def extract_referral_manager_bottom(lines: list) -> str:
     """
-    Use the last 'Atentamente' occurrence on the page (usually bottom/center).
+    Use the last 'Atentamente' occurrence (bottom).
     Then:
-      - look at next lines until a 'Visita:' footer is seen;
-      - if the first next line is numeric-only, skip it;
-      - the next line with letters is the name.
+      - scan downward until 'Visita:' footer;
+      - if first next line is numeric-only (e.g., '43', '345'), skip it;
+      - take the next alphabetic line as the name.
+    If no suitable line found BELOW, fall back to a good-looking name line just ABOVE Atentamente.
     """
     last_idx = None
     for i, ln in enumerate(lines):
@@ -270,21 +280,33 @@ def extract_referral_manager_bottom(lines: list) -> str:
             last_idx = i
     if last_idx is None:
         return ""
+    # determine end bound (before 'Visita:')
+    stop_idx = len(lines)
+    for j in range(last_idx+1, min(last_idx+10, len(lines))):
+        if re.search(r"^Visita\s*:", lines[j] or "", flags=re.I):
+            stop_idx = j
+            break
+
     # scan downward
-    saw_numeric_only_once = False
-    for j in range(last_idx+1, min(last_idx+8, len(lines))):
-        line = (lines[j] or "").strip()
-        if not line:
+    skipped_numeric = False
+    for j in range(last_idx+1, stop_idx):
+        line_raw = (lines[j] or "").strip()
+        if not line_raw:
             continue
-        if re.search(r"^Visita\s*:", line, flags=re.I):
-            break  # stop at footer
-        # numeric-only first line (e.g., "385", "43")
-        if re.fullmatch(r"\d+", line) and not saw_numeric_only_once:
-            saw_numeric_only_once = True
+        if re.fullmatch(r"\d+", line_raw) and not skipped_numeric:
+            skipped_numeric = True
             continue
-        name = _clean_name_line(line)
-        if name:
-            return name
+        cand = _clean_name_line(line_raw)
+        if cand and _looks_like_name(cand):
+            return cand
+
+    # fallback: look just above Atentamente (covers cases where name is printed above)
+    for k in range(last_idx-1, max(last_idx-4, -1), -1):
+        line_raw = (lines[k] or "").strip()
+        cand = _clean_name_line(line_raw)
+        if cand and _looks_like_name(cand):
+            return cand
+
     return ""
 
 def extract_city_and_phone(lines: list, raw_text: str) -> Tuple[str, str]:
@@ -292,7 +314,6 @@ def extract_city_and_phone(lines: list, raw_text: str) -> Tuple[str, str]:
     Preferred: after the first 'Cliente:' line, find first following line with TEL./Teléfono and
     return (text before TEL as City, digits after as Phone). Fallback: generic search.
     """
-    # Preferred (Cliente block)
     cliente_idx = None
     for i, ln in enumerate(lines):
         if re.search(r"\bCliente\b", ln, flags=re.I):
@@ -306,16 +327,16 @@ def extract_city_and_phone(lines: list, raw_text: str) -> Tuple[str, str]:
                 phone = _fmt_phone_mx(m.group(2) or "")
                 if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", city):
                     return (city.title(), phone)
-    # Fallback: generic
-    for rx in TEL_CITY_RXS:
-        for m in rx.finditer(raw_text or ""):
-            city = re.sub(r"\s+", " ", (m.group(1) or "").strip(" .,:;-"))
-            right = (m.group(2) or "").strip()
-            if not re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", city):
-                city = ""
-            phone = _fmt_phone_mx(right)
-            if city or phone:
-                return (city.title() if city else "", phone)
+    # fallback: generic city+TEL
+    for m in TEL_CITY_RXS[0].finditer(raw_text or ""):
+        city = re.sub(r"\s+", " ", (m.group(1) or "").strip(" .,:;-"))
+        right = (m.group(2) or "").strip()
+        if not re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", city):
+            city = ""
+        phone = _fmt_phone_mx(right)
+        if city or phone:
+            return (city.title() if city else "", phone)
+    # fallback: phone only
     for rx in TEL_ONLY_RXS:
         for m in rx.finditer(raw_text or ""):
             phone = _fmt_phone_mx(m.group(1) or "")
@@ -494,4 +515,4 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
                            use_container_width=True)
 
 st.markdown("---")
-st.caption("v16: bottom Atentamente → ReferralManager (skips numeric line, stops before 'Visita:'); First/Last from Contacto within Vigencia block; headers preserved.")
+st.caption("v17: ReferralManager strictly after last 'Atentamente' (skip numeric line, stop at 'Visita'), with fallback to line above when needed; First/Last from Contacto near Vigencia; headers preserved.")
