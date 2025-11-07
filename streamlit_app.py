@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v25)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v25")
-st.caption("FirstName extraction: 1) Contacto: field, 2) ATN pattern, 3) text between Moneda: XXX and Vendedor:. LastName always blank.")
+st.set_page_config(page_title="FINSA PDF → CSV (v26)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v26")
+st.caption("Enhanced FirstName extraction: Multiple Contacto: patterns, ATN pattern, and Moneda fallback. Handles names with parentheses.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -51,10 +51,16 @@ def _looks_like_person(name: str) -> bool:
     """Validates if string looks like a person's name (at least 2 words with letters)"""
     if not name:
         return False
+    
+    # Clean up common artifacts
+    name = re.sub(r"\([^)]*\)", "", name).strip()  # Remove parentheses content
+    name = re.sub(r"\s+", " ", name)  # Normalize spaces
+    
     # Block obvious non-name junk
-    if re.search(r"(visita|www|http|https|\.com|subtotal|total\b|iva\b|observaciones|condiciones|telefono|tel\.|vendedor|moneda|cliente|fecha)", name, re.I):
+    if re.search(r"(visita|www|http|https|\.com|subtotal|total\b|iva\b|observaciones|condiciones|telefono|tel\.|vendedor|moneda|cliente|fecha|almacen|vigencia|dias|entrega)", name, re.I):
         return False
-    # Must have at least 2 tokens with letters
+    
+    # Must have at least 2 tokens with letters (each at least 2 chars)
     toks = [t for t in name.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]{2,}", t)]
     return len(toks) >= 2
 
@@ -69,13 +75,22 @@ QNUM_RXS = [
 ]
 CLIENTE_ANYLINE_RX = re.compile(r"Cliente\s*:?\s*([^\n]*)", re.I)
 
-# Contact rules - improved for better extraction
+# Contact rules - MORE FLEXIBLE extraction patterns
+# Pattern 1: Contacto: followed by name (handles parentheses and extra text)
+CONTACTO_FLEXIBLE_RX = re.compile(
+    r"Contacto\s*:\s*([A-Za-zÁÉÍÓÚÑñ\s]+?)(?:\s*\(|$|\n|Almacen|Vigencia|Telefono|Tel\.|Moneda|Vendedor)",
+    re.I
+)
+
+# Pattern 2: More specific inline match
 CONTACTO_INLINE_RX = re.compile(
     r"Contacto\s*:\s*"
     r"([A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ]+){1,6})"
-    r"(?=\s*(?:\(|D[ií]as\s+Ent\b|D[ií]as\b|EDP\b|CANT\b|CLASIF\b|UNID\b|MODELO\b|PRECIO\b|IMPORTE\b|Moneda\b|Vendedor\b|Tel(?:efono)?\.?\b|$))",
+    r"(?=\s*(?:\(|D[ií]as\s+Ent\b|D[ií]as\b|EDP\b|CANT\b|CLASIF\b|UNID\b|MODELO\b|PRECIO\b|IMPORTE\b|Moneda\b|Vendedor\b|Tel(?:efono)?\.?\b|Almacen|Vigencia|$))",
     re.I
 )
+
+# Pattern 3: Line-based with better capture
 CONTACTO_LINE_RX = re.compile(r"Contacto\s*:\s*(.+?)(?:\n|$)", re.I | re.MULTILINE)
 
 # ATN pattern (appears before MXN currency)
@@ -213,24 +228,33 @@ def extract_referral_manager_bottom(lines: list) -> str:
     return ""
 
 # ========================
-# FirstName extraction (Contacto → ATN → Moneda…Vendedor fallback)
+# FirstName extraction (ENHANCED - Multiple strategies)
 # ========================
 def extract_firstname_only(lines: list, raw_text: str) -> str:
     """
     Priority order:
-    1. 'Contacto:' with name on same line or next line
+    1. 'Contacto:' field (multiple pattern attempts)
     2. 'ATN' pattern (common in PDFs without explicit Contacto field)
     3. Between 'Moneda: XXX' and 'Vendedor:' as last resort
     """
     
-    # PRIORITY 1: Global inline Contacto (same line)
+    # PRIORITY 1A: Flexible Contacto pattern (best for "Contacto: NAME (extra)")
+    m_flex = CONTACTO_FLEXIBLE_RX.search(raw_text or "")
+    if m_flex:
+        cand = _clean_spaces(m_flex.group(1))
+        # Remove any trailing punctuation or artifacts
+        cand = re.sub(r"[\(\),;:\-]+$", "", cand).strip()
+        if _looks_like_person(cand):
+            return cand.title()
+    
+    # PRIORITY 1B: Standard inline Contacto (same line)
     m_inline = CONTACTO_INLINE_RX.search(raw_text or "")
     if m_inline:
         full = _clean_spaces(m_inline.group(1))
         if _looks_like_person(full):
             return full.title()
 
-    # PRIORITY 1B: Line-based Contacto: scan for name after colon
+    # PRIORITY 1C: Line-based Contacto: scan for name after colon
     for i, ln in enumerate(lines):
         if not re.search(r"\bContacto\s*:", ln or "", flags=re.I):
             continue
@@ -239,10 +263,23 @@ def extract_firstname_only(lines: list, raw_text: str) -> str:
         m = CONTACTO_LINE_RX.search(ln or "")
         if m:
             right = _clean_spaces(m.group(1) or "")
-            # Clean out any parentheses or extra info
+            # Clean out parentheses, extra info, and trailing text
             right = re.sub(r"\([^)]*\)", "", right).strip()
-            if _looks_like_person(right) and len(right.split()) >= 2:
-                return right.title()
+            right = re.sub(r"(?:Almacen|Vigencia|Tel|Dias).*$", "", right, flags=re.I).strip()
+            
+            # Extract just the name part (first 2-4 words that look like names)
+            words = right.split()
+            name_words = []
+            for word in words[:4]:  # Check up to 4 words
+                if re.search(r"^[A-Za-zÁÉÍÓÚÑñ]{2,}$", word):
+                    name_words.append(word)
+                else:
+                    break  # Stop at first non-name word
+            
+            if len(name_words) >= 2:
+                name = " ".join(name_words)
+                if _looks_like_person(name):
+                    return name.title()
         
         # Check next 2 lines if nothing useful on same line
         for k in range(1, 3):
@@ -252,23 +289,29 @@ def extract_firstname_only(lines: list, raw_text: str) -> str:
             # Skip lines that are clearly not names
             if not nxt or ":" in nxt:
                 continue
-            if re.search(r"(Tel|Moneda|Vendedor|Cliente|Fecha|D[ií]as)", nxt, flags=re.I):
+            if re.search(r"(Tel|Moneda|Vendedor|Cliente|Fecha|D[ií]as|Almacen|Vigencia)", nxt, flags=re.I):
                 continue
-            if _looks_like_person(nxt) and len(nxt.split()) >= 2:
-                return nxt.title()
+            
+            # Extract just name words
+            words = nxt.split()
+            name_words = [w for w in words[:4] if re.search(r"^[A-Za-zÁÉÍÓÚÑñ]{2,}$", w)]
+            if len(name_words) >= 2:
+                name = " ".join(name_words)
+                if _looks_like_person(name):
+                    return name.title()
 
     # PRIORITY 2: ATN pattern (e.g., "ATN MONICA VENEGAS")
     m_atn = ATN_NAME_RX.search(raw_text or "")
     if m_atn:
         cand = _clean_spaces(m_atn.group(1))
-        if _looks_like_person(cand) and len(cand.split()) >= 2:
+        if _looks_like_person(cand):
             return cand.title()
 
     # PRIORITY 3: Fallback - between 'Moneda: MXN' and 'Vendedor:'
     m_mv = MONEDA_TO_VENDEDOR_RX.search(raw_text or "")
     if m_mv:
         cand = _clean_spaces(m_mv.group(2))
-        if _looks_like_person(cand) and len(cand.split()) >= 2:
+        if _looks_like_person(cand):
             return cand.title()
 
     return ""  # leave blank if not confidently found
@@ -450,7 +493,7 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
 
     if rows:
         df = pd.DataFrame(rows, columns=mapping_cols)
-        st.success("✅ Parsed successfully! FirstName extracted from Contacto:/ATN/Moneda pattern. LastName blank. Quantity summed.")
+        st.success("✅ Parsed successfully! FirstName extracted using enhanced Contacto:/ATN/Moneda patterns (v26). LastName blank.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
