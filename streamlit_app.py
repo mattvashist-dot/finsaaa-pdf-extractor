@@ -9,9 +9,9 @@ from pdfminer.high_level import extract_text
 # ========================
 # App config / constants
 # ========================
-st.set_page_config(page_title="FINSA PDF → CSV (v23)", layout="centered")
-st.title("FINSA PDF → Excel (CSV) – v23")
-st.caption("FirstName from Contacto: (full name) or left-of-Vendedor fallback. LastName blank. item_id/item_desc blank. Quantity sum improved.")
+st.set_page_config(page_title="FINSA PDF → CSV (v25)", layout="centered")
+st.title("FINSA PDF → Excel (CSV) – v25")
+st.caption("FirstName extraction: 1) Contacto: field, 2) ATN pattern, 3) text between Moneda: XXX and Vendedor:. LastName always blank.")
 
 MAX_FILES = 100
 MAX_FILE_MB = 25
@@ -48,12 +48,15 @@ def _clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _looks_like_person(name: str) -> bool:
+    """Validates if string looks like a person's name (at least 2 words with letters)"""
     if not name:
         return False
-    if re.search(r"(visita|www|http|https|\.com|subtotal|total|iva|observaciones|condiciones|telefono|tel\.)", name, re.I):
+    # Block obvious non-name junk
+    if re.search(r"(visita|www|http|https|\.com|subtotal|total\b|iva\b|observaciones|condiciones|telefono|tel\.|vendedor|moneda|cliente|fecha)", name, re.I):
         return False
-    toks = [t for t in name.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", t)]
-    return 2 <= len(toks) <= 6
+    # Must have at least 2 tokens with letters
+    toks = [t for t in name.split() if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]{2,}", t)]
+    return len(toks) >= 2
 
 # ========================
 # Regex patterns
@@ -66,15 +69,28 @@ QNUM_RXS = [
 ]
 CLIENTE_ANYLINE_RX = re.compile(r"Cliente\s*:?\s*([^\n]*)", re.I)
 
-# Contact-related
+# Contact rules - improved for better extraction
 CONTACTO_INLINE_RX = re.compile(
     r"Contacto\s*:\s*"
-    r"([A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ]+){1,5})"
+    r"([A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ]+){1,6})"
     r"(?=\s*(?:\(|D[ií]as\s+Ent\b|D[ií]as\b|EDP\b|CANT\b|CLASIF\b|UNID\b|MODELO\b|PRECIO\b|IMPORTE\b|Moneda\b|Vendedor\b|Tel(?:efono)?\.?\b|$))",
     re.I
 )
-VEND_LINE_RX = re.compile(r"\bVendedor\s*:", re.I)
-MONEDA_CHUNK_RX = re.compile(r"Moneda\s*:\s*[A-Z]{3}", re.I)
+CONTACTO_LINE_RX = re.compile(r"Contacto\s*:\s*(.+?)(?:\n|$)", re.I | re.MULTILINE)
+
+# ATN pattern (appears before MXN currency)
+ATN_NAME_RX = re.compile(
+    r"ATN\s+([A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ]+){1,5})",
+    re.I
+)
+
+# Fallback: text between Moneda: XXX and Vendedor:
+MONEDA_TO_VENDEDOR_RX = re.compile(
+    r"Moneda\s*:\s*([A-Z]{3})\s+"
+    r"([A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ]+){1,6})"
+    r"\s+Vendedor\s*:",
+    re.I
+)
 
 # Footer / Tel / City
 ATN_WORD_RX  = re.compile(r"Atentamente\s*$", re.I)
@@ -92,12 +108,11 @@ ITEM_BLOCK_RX = re.compile(
 MONEY_RX = re.compile(r"\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b")
 
 # Units & Qty
-UNIT_WORDS = ["PZA", "PZAS", "JUEGO", "KIT", "SET", "UND", "PCS"]
 UNIT_WORDS_RX = r"(?:PZA|PZAS|JUEGO|KIT|SET|UND|PCS)"
 QTY_DEC_RX = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 
 # ========================
-# Total (3rd monetary after subtotal)
+# Totals (3rd monetary value near subtotal)
 # ========================
 def find_total_third_money_line(raw_text: str) -> str:
     if not raw_text: return ""
@@ -159,7 +174,7 @@ def extract_city_and_phone(lines: list, raw_text: str) -> Tuple[str, str]:
     return ("", "")
 
 # ========================
-# Referral Manager (bottom, after "Atentamente")
+# Referral Manager (after "Atentamente")
 # ========================
 def extract_referral_manager_bottom(lines: list) -> str:
     last_idx = None
@@ -187,7 +202,7 @@ def extract_referral_manager_bottom(lines: list) -> str:
     if candidates:
         candidates.sort(key=lambda s: (len(s.split()), len(s)), reverse=True)
         return candidates[0].title()
-    # fallback: look a few lines above
+    # fallback: look above
     for k in range(last_idx-1, max(last_idx-5, -1), -1):
         cand = (lines[k] or "").strip()
         phrases = re.findall(r"([A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+){1,5})", cand)
@@ -198,35 +213,63 @@ def extract_referral_manager_bottom(lines: list) -> str:
     return ""
 
 # ========================
-# FirstName only (Contacto or left-of-Vendedor)
+# FirstName extraction (Contacto → ATN → Moneda…Vendedor fallback)
 # ========================
 def extract_firstname_only(lines: list, raw_text: str) -> str:
-    # Rule 1: global inline "Contacto: <FULL NAME>" with hard-stop tokens
+    """
+    Priority order:
+    1. 'Contacto:' with name on same line or next line
+    2. 'ATN' pattern (common in PDFs without explicit Contacto field)
+    3. Between 'Moneda: XXX' and 'Vendedor:' as last resort
+    """
+    
+    # PRIORITY 1: Global inline Contacto (same line)
     m_inline = CONTACTO_INLINE_RX.search(raw_text or "")
     if m_inline:
         full = _clean_spaces(m_inline.group(1))
         if _looks_like_person(full):
             return full.title()
 
-    # Rule 2: left-of-"Vendedor:" (remove "Moneda: XXX"; longest 2–6 word phrase)
-    vend_idx = None
-    for i, l in enumerate(lines):
-        if VEND_LINE_RX.search(l or ""):
-            vend_idx = i
-            break
-    if vend_idx is not None:
-        left = lines[vend_idx].split("Vendedor", 1)[0]
-        prev_chunk = ""
-        if vend_idx - 1 >= 0 and len(lines[vend_idx - 1].strip()) < 80:
-            prev_chunk = lines[vend_idx - 1].strip()
-        candidate = _clean_spaces((prev_chunk + " " + left).strip())
-        candidate = MONEDA_CHUNK_RX.sub(" ", candidate)
-        candidate = _clean_spaces(candidate)
-        phrases = re.findall(r"([A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+(?:\s+[A-Za-zÁÉÍÓÚÑñ][A-Za-zÁÉÍÓÚÑñ]+){1,5})", candidate)
-        phrases = [p for p in phrases if _looks_like_person(p)]
-        if phrases:
-            phrases.sort(key=lambda s: (len(s.split()), len(s)), reverse=True)
-            return phrases[0].title()
+    # PRIORITY 1B: Line-based Contacto: scan for name after colon
+    for i, ln in enumerate(lines):
+        if not re.search(r"\bContacto\s*:", ln or "", flags=re.I):
+            continue
+        
+        # Check same line after colon
+        m = CONTACTO_LINE_RX.search(ln or "")
+        if m:
+            right = _clean_spaces(m.group(1) or "")
+            # Clean out any parentheses or extra info
+            right = re.sub(r"\([^)]*\)", "", right).strip()
+            if _looks_like_person(right) and len(right.split()) >= 2:
+                return right.title()
+        
+        # Check next 2 lines if nothing useful on same line
+        for k in range(1, 3):
+            if i + k >= len(lines):
+                break
+            nxt = _clean_spaces(lines[i + k])
+            # Skip lines that are clearly not names
+            if not nxt or ":" in nxt:
+                continue
+            if re.search(r"(Tel|Moneda|Vendedor|Cliente|Fecha|D[ií]as)", nxt, flags=re.I):
+                continue
+            if _looks_like_person(nxt) and len(nxt.split()) >= 2:
+                return nxt.title()
+
+    # PRIORITY 2: ATN pattern (e.g., "ATN MONICA VENEGAS")
+    m_atn = ATN_NAME_RX.search(raw_text or "")
+    if m_atn:
+        cand = _clean_spaces(m_atn.group(1))
+        if _looks_like_person(cand) and len(cand.split()) >= 2:
+            return cand.title()
+
+    # PRIORITY 3: Fallback - between 'Moneda: MXN' and 'Vendedor:'
+    m_mv = MONEDA_TO_VENDEDOR_RX.search(raw_text or "")
+    if m_mv:
+        cand = _clean_spaces(m_mv.group(2))
+        if _looks_like_person(cand) and len(cand.split()) >= 2:
+            return cand.title()
 
     return ""  # leave blank if not confidently found
 
@@ -283,7 +326,6 @@ def parse_qty_sum(raw_text: str) -> str:
     Inside the item block (between header and Sub-Total), sum quantities in two layouts:
       A) <UNIT> <QTY>  (e.g., 'JUEGO 1.00', 'PZA 2')
       B) <QTY> <UNIT>  (rare but handled)
-    Ignores monetary amounts and other numbers.
     """
     m_block = ITEM_BLOCK_RX.search(raw_text or "")
     if not m_block:
@@ -294,24 +336,17 @@ def parse_qty_sum(raw_text: str) -> str:
 
     # A) UNIT then QTY
     for m in re.finditer(rf"\b{UNIT_WORDS_RX}\b\s+(\d+(?:[.,]\d+)?)", block, flags=re.I):
-        q = m.group(1)
-        q = q.replace(",", ".")
+        q = m.group(1).replace(",", ".")
         try:
             total += float(q); found = True
         except:
             pass
 
-    # B) QTY then UNIT (ensure not a price by looking ahead a short distance for a currency-like price with 2 decimals)
+    # B) QTY then UNIT
     for m in re.finditer(rf"(\d+(?:[.,]\d+)?)\s+\b{UNIT_WORDS_RX}\b", block, flags=re.I):
-        qty_str = m.group(1).replace(",", ".")
-        # heuristic: if within 15 chars after this match we immediately hit a price-like number with 2 decimals AND separators,
-        # it's probably not the qty pattern we already counted (avoid double-count).
-        tail = block[m.end(): m.end() + 20]
-        if re.search(r"\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\b", tail):
-            # could be the price – but we still count the qty before it
-            pass
+        q = m.group(1).replace(",", ".")
         try:
-            total += float(qty_str); found = True
+            total += float(q); found = True
         except:
             pass
 
@@ -327,7 +362,7 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     qnum = extract_quote_number(lines, raw)
     qdate = extract_date(raw)
     company = extract_company(lines, raw)
-    firstname = extract_firstname_only(lines, raw)  # FirstName = full contact name
+    firstname = extract_firstname_only(lines, raw)  # FirstName = contact name; LastName blank
     city, phone = extract_city_and_phone(lines, raw)
 
     currency = ""
@@ -353,8 +388,8 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     setcol("QuoteNumber", qnum)
     setcol("QuoteDate", qdate)
     setcol("Company", company)
-    setcol("FirstName", firstname)   # full name into FirstName
-    setcol("LastName", "")           # always blank per request
+    setcol("FirstName", firstname)  # full name from Contacto or ATN or Moneda..Vendedor
+    setcol("LastName", "")          # always blank per request
     setcol("ContactEmail", "")
     setcol("ContactPhone", phone)
     setcol("Address", "")
@@ -364,8 +399,8 @@ def parse_pdf(file_name: str, data: bytes, out_cols: List[str]) -> Dict[str, str
     setcol("ZipCode", "")
     setcol("Country", "Mexico" if currency == "MXN" else "")
     setcol("manufacturer_Name", "")
-    setcol("item_id", "")            # always blank per request
-    setcol("item_desc", "")          # always blank per request
+    setcol("item_id", "")           # always blank per request
+    setcol("item_desc", "")         # always blank per request
     setcol("Quantity", qty_total)
     setcol("TotalSales", total)
     setcol("PDF", pdf_name)
@@ -415,7 +450,7 @@ if st.button("🔄 Extract to CSV", use_container_width=True):
 
     if rows:
         df = pd.DataFrame(rows, columns=mapping_cols)
-        st.success("Parsed. FirstName from Contacto: (full) or left-of-Vendedor fallback. item_id/item_desc blank. Quantity summed across all lines.")
+        st.success("✅ Parsed successfully! FirstName extracted from Contacto:/ATN/Moneda pattern. LastName blank. Quantity summed.")
         st.dataframe(df, use_container_width=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
